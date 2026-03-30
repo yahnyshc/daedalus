@@ -217,6 +217,20 @@ Near-term extensions after the core demo:
 
 ## Status
 
-This repo currently captures the v1 vision and product shape. The implementation should stay anchored to that promise:
+This repo now includes an initial Rust CLI scaffold for the v1 surface area described above. The implementation is intentionally base-level: it establishes the project shape, repo-local state model, command structure, and shadow git-backed checkpoint storage without claiming full hook-driven protection yet.
+
+The implementation should stay anchored to the same promise:
 
 protect agent runs, checkpoint before risky actions, restore cleanly, then resume or fork from the exact decision point.
+
+## Current Base
+
+The scaffold currently provides:
+
+- a Rust workspace with the `ddl` CLI crate
+- repo-local `.daedalus/` state initialization
+- timeline, run, and checkpoint metadata records
+- shadow git-backed snapshot storage under `.daedalus/shadow/`
+- working `init`, `log`, `diff`, `restore`, `resume`, and `fork` command paths at baseline fidelity
+
+The current code is a foundation, not the finished v1 product. Automatic checkpointing around specific unsafe actions, deeper transcript capture, and richer integrations remain follow-on work.

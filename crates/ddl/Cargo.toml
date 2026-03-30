@@ -1,0 +1,15 @@
+[package]
+name = "ddl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI scaffold for daedalus, a checkpointing layer for coding agents."
+
+[lib]
+name = "ddl"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ddl"
+path = "src/main.rs"
+
