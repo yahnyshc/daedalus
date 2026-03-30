@@ -23,11 +23,22 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         CommandLine::Run { command } => {
             let store = DaedalusStore::discover()?;
             let result = store.run_agent(command)?;
-            println!(
-                "run {} started on timeline {} from checkpoint {}",
-                result.run_id, result.timeline_id, result.checkpoint_id
-            );
+            if let Some(checkpoint_id) = result.latest_checkpoint_id {
+                println!(
+                    "run {} finished on timeline {} with latest checkpoint {}",
+                    result.run_id, result.timeline_id, checkpoint_id
+                );
+            } else {
+                println!(
+                    "run {} finished on timeline {} with no checkpoints yet",
+                    result.run_id, result.timeline_id
+                );
+            }
             Ok(result.exit_code)
+        }
+        CommandLine::Shell { command } => {
+            let store = DaedalusStore::discover()?;
+            store.run_shell_command(command)
         }
         CommandLine::Log => {
             let store = DaedalusStore::discover()?;
@@ -73,6 +84,9 @@ enum CommandLine {
     Run {
         command: Vec<String>,
     },
+    Shell {
+        command: Vec<String>,
+    },
     Log,
     Diff {
         checkpoint_a: Option<String>,
@@ -105,6 +119,7 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         "init" => Ok(CommandLine::Init),
         "log" => Ok(CommandLine::Log),
         "run" => parse_run(parts),
+        "shell" => parse_shell(parts),
         "diff" => parse_diff(parts),
         "restore" => parse_single_value(parts, "restore")
             .map(|checkpoint| CommandLine::Restore { checkpoint }),
@@ -136,6 +151,18 @@ fn parse_run(parts: Vec<String>) -> Result<CommandLine> {
     }
 
     Ok(CommandLine::Run {
+        command: parts.into_iter().skip(3).collect(),
+    })
+}
+
+fn parse_shell(parts: Vec<String>) -> Result<CommandLine> {
+    if parts.len() < 4 || parts[2] != "--" {
+        return Err(DdlError::InvalidInput(
+            "usage: ddl shell -- <command>".to_string(),
+        ));
+    }
+
+    Ok(CommandLine::Shell {
         command: parts.into_iter().skip(3).collect(),
     })
 }
@@ -206,8 +233,12 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
             .unwrap_or_default();
         println!("timeline {}{}", timeline.id, label);
         println!("  run: {}", timeline.run_id);
-        println!("  root checkpoint: {}", timeline.root_checkpoint_id);
-        if let Some(source) = timeline.source_checkpoint_id {
+        if let Some(root_checkpoint_id) = &timeline.root_checkpoint_id {
+            println!("  root checkpoint: {root_checkpoint_id}");
+        } else {
+            println!("  root checkpoint: none yet");
+        }
+        if let Some(source) = &timeline.source_checkpoint_id {
             println!("  source checkpoint: {source}");
         }
 
@@ -215,9 +246,14 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
             .iter()
             .filter(|checkpoint| checkpoint.timeline_id == timeline.id)
         {
+            let trigger = checkpoint
+                .trigger_command
+                .as_deref()
+                .map(|command| format!(" ({command})"))
+                .unwrap_or_default();
             println!(
-                "  checkpoint {} [{}] {}",
-                checkpoint.id, checkpoint.resumability, checkpoint.reason
+                "  checkpoint {} [{}] {}{}",
+                checkpoint.id, checkpoint.resumability, checkpoint.reason, trigger
             );
         }
     }
@@ -233,6 +269,7 @@ daedalus v1 CLI scaffold
 Usage:
   ddl init
   ddl run -- <agent command>
+  ddl shell -- <command>
   ddl log
   ddl diff [checkpoint_a] [checkpoint_b]
   ddl restore <checkpoint_id>

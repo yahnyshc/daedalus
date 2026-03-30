@@ -1,18 +1,24 @@
+use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, NormalizedCommand};
 use crate::error::{DdlError, Result};
 use crate::ids::next_id;
 use crate::model::{
     CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint, TimelineRecord,
 };
+use crate::runtime::{
+    ENV_REAL_SHELL, ShellWrapperContext, SupportedRuntime, apply_runtime_environment,
+    current_shell_context,
+};
 
 const STATE_DIR: &str = ".daedalus";
 const SNAPSHOT_DIR_NAME: &str = "snapshots";
-const CONFIG_VERSION: &str = "1";
+const LEGACY_CONFIG_FILE_NAME: &str = "config";
 const PRESERVED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
 
 #[derive(Clone, Debug)]
@@ -32,8 +38,21 @@ pub struct DaedalusStore {
 pub struct RunInvocation {
     pub timeline_id: String,
     pub run_id: String,
-    pub checkpoint_id: String,
+    pub latest_checkpoint_id: Option<String>,
     pub exit_code: i32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CheckpointTriggerMetadata {
+    tool_type: Option<String>,
+    command: Option<String>,
+    runtime_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StandaloneShellRun {
+    timeline_id: String,
+    run_id: String,
 }
 
 impl DaedalusStore {
@@ -43,7 +62,7 @@ impl DaedalusStore {
     }
 
     pub fn discover_from(cwd: &Path) -> Result<Self> {
-        let repo_root = resolve_repo_root(&cwd)?;
+        let repo_root = resolve_repo_root(cwd)?;
         let state_dir = repo_root.join(STATE_DIR);
         Ok(Self {
             repo_root,
@@ -70,11 +89,11 @@ impl DaedalusStore {
         fs::create_dir_all(&self.tool_outputs_dir)?;
         fs::create_dir_all(&self.snapshots_dir)?;
 
-        let config_path = self.state_dir.join("config");
-        fs::write(
-            config_path,
-            format!("version={CONFIG_VERSION}\nstorage=shadow-git\n"),
-        )?;
+        fs::write(self.state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)?;
+        let legacy_config = self.state_dir.join(LEGACY_CONFIG_FILE_NAME);
+        if legacy_config.exists() {
+            fs::remove_file(legacy_config)?;
+        }
 
         if !self.shadow_dir.join(".git").exists() {
             run_command(
@@ -123,24 +142,18 @@ impl DaedalusStore {
 
     pub fn run_agent(&self, command: Vec<String>) -> Result<RunInvocation> {
         self.ensure_initialized()?;
-        if command.is_empty() {
-            return Err(DdlError::InvalidInput(
-                "missing agent command after `ddl run --`".to_string(),
-            ));
-        }
+        self.load_config()?;
+        let runtime = SupportedRuntime::detect(&command)?;
 
         let created_at = unix_timestamp();
         let run_id = next_id("run");
         let timeline_id = next_id("tl");
 
-        let checkpoint =
-            self.create_checkpoint_internal(&timeline_id, &run_id, None, "run-start".to_string())?;
-
         let timeline = TimelineRecord {
             id: timeline_id.clone(),
             name: Some("main".to_string()),
             run_id: run_id.clone(),
-            root_checkpoint_id: checkpoint.id.clone(),
+            root_checkpoint_id: None,
             source_checkpoint_id: None,
             created_at,
         };
@@ -152,19 +165,19 @@ impl DaedalusStore {
             command: command.clone(),
             created_at,
             status: RunStatus::Running,
-            last_checkpoint_id: checkpoint.id.clone(),
+            last_checkpoint_id: None,
             resumability: Resumability::Full,
         };
         self.write_run(&run)?;
 
-        let status = Command::new(&command[0])
-            .args(command.iter().skip(1))
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()?;
+        let shell_context = ShellWrapperContext {
+            run_id: run_id.clone(),
+            timeline_id: timeline_id.clone(),
+            runtime,
+        };
+        let status = self.execute_owned_command(&command, Some(&shell_context))?;
 
+        run = self.read_run(&run_id)?;
         run.status = if status.success() {
             RunStatus::Succeeded
         } else {
@@ -175,9 +188,54 @@ impl DaedalusStore {
         Ok(RunInvocation {
             timeline_id,
             run_id,
-            checkpoint_id: checkpoint.id,
+            latest_checkpoint_id: run.last_checkpoint_id,
             exit_code: status.code().unwrap_or(1),
         })
+    }
+
+    pub fn run_shell_command(&self, command: Vec<String>) -> Result<i32> {
+        self.ensure_initialized()?;
+        if command.is_empty() {
+            return Err(DdlError::InvalidInput(
+                "missing command after `ddl shell --`".to_string(),
+            ));
+        }
+
+        let config = self.load_config()?;
+        let real_shell = env::var(ENV_REAL_SHELL).ok();
+        let normalized = match real_shell.as_deref() {
+            Some(_) => NormalizedCommand::from_shell_args(&command),
+            None => NormalizedCommand::from_argv(command.clone()),
+        };
+
+        let mut standalone = None;
+        if config.matching_bash_rule(&normalized.argv).is_some() {
+            standalone = match current_shell_context() {
+                Some(context) => {
+                    self.record_shell_checkpoint(&context, &normalized)?;
+                    None
+                }
+                None => {
+                    let run = self.create_standalone_shell_run(&command)?;
+                    self.record_standalone_shell_checkpoint(&run, &normalized)?;
+                    Some(run)
+                }
+            };
+        }
+
+        let status = self.execute_shell_command(&command, real_shell.as_deref())?;
+
+        if let Some(run) = standalone {
+            let mut record = self.read_run(&run.run_id)?;
+            record.status = if status.success() {
+                RunStatus::Succeeded
+            } else {
+                RunStatus::Failed
+            };
+            self.write_run(&record)?;
+        }
+
+        Ok(status.code().unwrap_or(1))
     }
 
     pub fn resume(&self, checkpoint_id: &str) -> Result<i32> {
@@ -192,24 +250,21 @@ impl DaedalusStore {
         let mut run = self.read_run(&checkpoint.run_id)?;
         self.restore(checkpoint_id)?;
 
-        let next_checkpoint = self.create_checkpoint_internal(
-            &checkpoint.timeline_id,
-            &checkpoint.run_id,
-            Some(checkpoint.id.clone()),
-            "resume-start".to_string(),
-        )?;
-        run.last_checkpoint_id = next_checkpoint.id;
+        run.last_checkpoint_id = Some(checkpoint.id.clone());
         run.status = RunStatus::Running;
         self.write_run(&run)?;
 
-        let status = Command::new(&run.command[0])
-            .args(run.command.iter().skip(1))
-            .current_dir(&self.repo_root)
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()?;
+        let runtime = SupportedRuntime::detect(&run.command).ok();
+        if runtime.is_some() {
+            self.load_config()?;
+        }
+        let shell_context = runtime.map(|runtime| ShellWrapperContext {
+            run_id: run.id.clone(),
+            timeline_id: checkpoint.timeline_id.clone(),
+            runtime,
+        });
 
+        let status = self.execute_owned_command(&run.command, shell_context.as_ref())?;
         run.status = if status.success() {
             RunStatus::Succeeded
         } else {
@@ -239,7 +294,7 @@ impl DaedalusStore {
             id: timeline_id.clone(),
             name,
             run_id: run_id.clone(),
-            root_checkpoint_id: checkpoint.id.clone(),
+            root_checkpoint_id: Some(checkpoint.id.clone()),
             source_checkpoint_id: Some(source.id),
             created_at: unix_timestamp(),
         };
@@ -251,7 +306,7 @@ impl DaedalusStore {
             command: source_run.command,
             created_at: unix_timestamp(),
             status: RunStatus::Forked,
-            last_checkpoint_id: checkpoint.id,
+            last_checkpoint_id: Some(checkpoint.id),
             resumability: Resumability::Full,
         };
         self.write_run(&run)?;
@@ -346,6 +401,17 @@ impl DaedalusStore {
         RunRecord::read(&path)
     }
 
+    pub fn read_timeline(&self, timeline_id: &str) -> Result<TimelineRecord> {
+        let path = self.timelines_dir.join(format!("{timeline_id}.meta"));
+        if !path.exists() {
+            return Err(DdlError::NotFound {
+                kind: "timeline",
+                id: timeline_id.to_string(),
+            });
+        }
+        TimelineRecord::read(&path)
+    }
+
     pub fn read_checkpoint(&self, checkpoint_id: &str) -> Result<CheckpointRecord> {
         let path = self.checkpoints_dir.join(format!("{checkpoint_id}.meta"));
         if !path.exists() {
@@ -355,6 +421,20 @@ impl DaedalusStore {
             });
         }
         CheckpointRecord::read(&path)
+    }
+
+    fn load_config(&self) -> Result<DaedalusConfig> {
+        let path = self.state_dir.join(CONFIG_FILE_NAME);
+        if !path.exists() {
+            return Err(DdlError::InvalidConfig(format!(
+                "daedalus checkpointing is not configured in {}; re-run `ddl init` or migrate to {}",
+                self.repo_root.display(),
+                path.display()
+            )));
+        }
+
+        let raw = fs::read_to_string(&path)?;
+        DaedalusConfig::parse(&raw)
     }
 
     fn write_run(&self, run: &RunRecord) -> Result<()> {
@@ -369,12 +449,153 @@ impl DaedalusStore {
         checkpoint.write(&self.checkpoints_dir.join(format!("{}.meta", checkpoint.id)))
     }
 
+    fn create_standalone_shell_run(&self, command: &[String]) -> Result<StandaloneShellRun> {
+        let created_at = unix_timestamp();
+        let run_id = next_id("run");
+        let timeline_id = next_id("tl");
+
+        let timeline = TimelineRecord {
+            id: timeline_id.clone(),
+            name: Some("shell".to_string()),
+            run_id: run_id.clone(),
+            root_checkpoint_id: None,
+            source_checkpoint_id: None,
+            created_at,
+        };
+        self.write_timeline(&timeline)?;
+
+        let run = RunRecord {
+            id: run_id.clone(),
+            timeline_id: timeline_id.clone(),
+            command: command.to_vec(),
+            created_at,
+            status: RunStatus::Running,
+            last_checkpoint_id: None,
+            resumability: Resumability::Full,
+        };
+        self.write_run(&run)?;
+
+        Ok(StandaloneShellRun {
+            timeline_id,
+            run_id,
+        })
+    }
+
+    fn record_shell_checkpoint(
+        &self,
+        context: &ShellWrapperContext,
+        normalized: &NormalizedCommand,
+    ) -> Result<CheckpointRecord> {
+        let mut run = self.read_run(&context.run_id)?;
+        let mut timeline = self.read_timeline(&context.timeline_id)?;
+
+        let checkpoint = self.create_checkpoint_internal(
+            &timeline.id,
+            &run.id,
+            run.last_checkpoint_id.clone(),
+            "before-shell".to_string(),
+            CheckpointTriggerMetadata {
+                tool_type: Some("bash".to_string()),
+                command: Some(normalized.command_string.clone()),
+                runtime_name: Some(context.runtime.as_str().to_string()),
+            },
+        )?;
+
+        run.last_checkpoint_id = Some(checkpoint.id.clone());
+        self.write_run(&run)?;
+
+        if timeline.root_checkpoint_id.is_none() {
+            timeline.root_checkpoint_id = Some(checkpoint.id.clone());
+            self.write_timeline(&timeline)?;
+        }
+
+        Ok(checkpoint)
+    }
+
+    fn record_standalone_shell_checkpoint(
+        &self,
+        run: &StandaloneShellRun,
+        normalized: &NormalizedCommand,
+    ) -> Result<CheckpointRecord> {
+        let mut run_record = self.read_run(&run.run_id)?;
+        let mut timeline = self.read_timeline(&run.timeline_id)?;
+
+        let checkpoint = self.create_checkpoint_internal(
+            &run.timeline_id,
+            &run.run_id,
+            run_record.last_checkpoint_id.clone(),
+            "before-shell".to_string(),
+            CheckpointTriggerMetadata {
+                tool_type: Some("bash".to_string()),
+                command: Some(normalized.command_string.clone()),
+                runtime_name: None,
+            },
+        )?;
+
+        run_record.last_checkpoint_id = Some(checkpoint.id.clone());
+        self.write_run(&run_record)?;
+
+        if timeline.root_checkpoint_id.is_none() {
+            timeline.root_checkpoint_id = Some(checkpoint.id.clone());
+            self.write_timeline(&timeline)?;
+        }
+
+        Ok(checkpoint)
+    }
+
+    fn execute_owned_command(
+        &self,
+        command: &[String],
+        shell_context: Option<&ShellWrapperContext>,
+    ) -> Result<ExitStatus> {
+        let mut process = Command::new(&command[0]);
+        process
+            .args(command.iter().skip(1))
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        if let Some(context) = shell_context {
+            apply_runtime_environment(&mut process, &self.repo_root, &self.state_dir, context)?;
+        } else {
+            process.current_dir(&self.repo_root);
+        }
+
+        Ok(process.status()?)
+    }
+
+    fn execute_shell_command(
+        &self,
+        command: &[String],
+        real_shell: Option<&str>,
+    ) -> Result<ExitStatus> {
+        let mut process = match real_shell {
+            Some(program) => {
+                let mut process = Command::new(program);
+                process.args(command);
+                process
+            }
+            None => {
+                let mut process = Command::new(&command[0]);
+                process.args(command.iter().skip(1));
+                process
+            }
+        };
+
+        process
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+        Ok(process.status()?)
+    }
+
     fn create_checkpoint_internal(
         &self,
         timeline_id: &str,
         run_id: &str,
         parent_checkpoint_id: Option<String>,
         reason: String,
+        trigger: CheckpointTriggerMetadata,
     ) -> Result<CheckpointRecord> {
         let checkpoint_id = next_id("cp");
         let snapshot_rel_path = format!("{SNAPSHOT_DIR_NAME}/{checkpoint_id}");
@@ -428,6 +649,9 @@ impl DaedalusStore {
             shadow_commit,
             created_at: unix_timestamp(),
             resumability: Resumability::Full,
+            trigger_tool_type: trigger.tool_type,
+            trigger_command: trigger.command,
+            runtime_name: trigger.runtime_name,
             fingerprint: self.capture_fingerprint()?,
         };
         self.write_checkpoint(&checkpoint)?;
@@ -492,6 +716,9 @@ impl DaedalusStore {
             shadow_commit,
             created_at: unix_timestamp(),
             resumability: Resumability::Full,
+            trigger_tool_type: None,
+            trigger_command: None,
+            runtime_name: None,
             fingerprint: source.fingerprint.clone(),
         };
         self.write_checkpoint(&checkpoint)?;
@@ -679,11 +906,20 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::{Mutex, OnceLock};
+
+    use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON};
+    use crate::runtime::{ENV_RUN_ID, ENV_RUNTIME, ENV_TIMELINE_ID};
 
     use super::DaedalusStore;
 
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
-    fn init_creates_state_directories() {
+    fn init_creates_state_directories_and_json_config() {
         let repo_root = create_temp_repo("init");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -692,23 +928,160 @@ mod tests {
         assert!(repo_root.join(".daedalus").exists());
         assert!(repo_root.join(".daedalus/shadow/.git").exists());
         assert!(repo_root.join(".daedalus/checkpoints").exists());
+        assert_eq!(
+            fs::read_to_string(repo_root.join(".daedalus").join(CONFIG_FILE_NAME))
+                .expect("read config"),
+            DEFAULT_CONFIG_JSON
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn shell_command_creates_checkpoint_before_matching_mutation() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("shell-match");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::write(repo_root.join("test.txt"), "hello").expect("seed file");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+
+        let exit_code = store
+            .run_shell_command(vec!["rm".to_string(), "test.txt".to_string()])
+            .expect("run shell");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        assert!(!repo_root.join("test.txt").exists());
+
+        let checkpoints = store.list_checkpoints().expect("list checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].reason, "before-shell");
+        assert_eq!(
+            checkpoints[0].trigger_command.as_deref(),
+            Some("rm test.txt")
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn shell_command_skips_non_matching_commands() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("shell-skip");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+
+        let exit_code = store
+            .run_shell_command(vec!["pwd".to_string()])
+            .expect("run shell");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            store
+                .list_checkpoints()
+                .expect("list checkpoints")
+                .is_empty()
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn shell_command_uses_existing_runtime_context() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("shell-runtime");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::write(repo_root.join("test.txt"), "hello").expect("seed file");
+
+        let created_at = super::unix_timestamp();
+        let run_id = "run_test".to_string();
+        let timeline_id = "tl_test".to_string();
+        store
+            .write_timeline(&crate::model::TimelineRecord {
+                id: timeline_id.clone(),
+                name: Some("main".to_string()),
+                run_id: run_id.clone(),
+                root_checkpoint_id: None,
+                source_checkpoint_id: None,
+                created_at,
+            })
+            .expect("write timeline");
+        store
+            .write_run(&crate::model::RunRecord {
+                id: run_id.clone(),
+                timeline_id: timeline_id.clone(),
+                command: vec!["codex".to_string()],
+                created_at,
+                status: crate::model::RunStatus::Running,
+                last_checkpoint_id: None,
+                resumability: crate::model::Resumability::Full,
+            })
+            .expect("write run");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        unsafe {
+            std::env::set_var(ENV_RUN_ID, &run_id);
+            std::env::set_var(ENV_TIMELINE_ID, &timeline_id);
+            std::env::set_var(ENV_RUNTIME, "codex");
+        }
+
+        let exit_code = store
+            .run_shell_command(vec!["rm".to_string(), "test.txt".to_string()])
+            .expect("run shell");
+
+        unsafe {
+            std::env::remove_var(ENV_RUN_ID);
+            std::env::remove_var(ENV_TIMELINE_ID);
+            std::env::remove_var(ENV_RUNTIME);
+        }
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        let checkpoints = store.list_checkpoints().expect("list checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].runtime_name.as_deref(), Some("codex"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
 
     #[test]
     fn fork_clones_checkpoint_into_new_timeline() {
+        let _guard = test_lock().lock().expect("lock tests");
         let repo_root = create_temp_repo("fork");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
         fs::write(repo_root.join("README.md"), "hello").expect("seed file");
-        let run = store
-            .run_agent(vec!["/usr/bin/true".to_string()])
-            .expect("run command");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        store
+            .run_shell_command(vec!["rm".to_string(), "README.md".to_string()])
+            .expect("run shell");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        let checkpoint_id = store
+            .list_checkpoints()
+            .expect("checkpoints")
+            .last()
+            .expect("checkpoint")
+            .id
+            .clone();
 
         let (timeline_id, run_id) = store
-            .fork(&run.checkpoint_id, Some("alt".to_string()))
+            .fork(&checkpoint_id, Some("alt".to_string()))
             .expect("fork");
         assert!(!timeline_id.is_empty());
         assert!(!run_id.is_empty());

@@ -8,8 +8,10 @@ pub enum DdlError {
     Io(std::io::Error),
     ParseInt(std::num::ParseIntError),
     InvalidInput(String),
+    InvalidConfig(String),
     InvalidState(String),
     NotInitialized(PathBuf),
+    UnsupportedRuntime(String),
     NotFound {
         kind: &'static str,
         id: String,
@@ -27,11 +29,16 @@ impl Display for DdlError {
             Self::Io(error) => write!(f, "{error}"),
             Self::ParseInt(error) => write!(f, "{error}"),
             Self::InvalidInput(message) => write!(f, "{message}"),
+            Self::InvalidConfig(message) => write!(f, "{message}"),
             Self::InvalidState(message) => write!(f, "{message}"),
             Self::NotInitialized(path) => write!(
                 f,
                 "repository is not initialized for daedalus: run `ddl init` in {}",
                 path.display()
+            ),
+            Self::UnsupportedRuntime(runtime) => write!(
+                f,
+                "runtime `{runtime}` is not yet supported; supported runtimes: codex, claude"
             ),
             Self::NotFound { kind, id } => write!(f, "{kind} `{id}` was not found"),
             Self::CommandFailed {

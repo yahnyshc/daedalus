@@ -32,7 +32,7 @@ That makes recovery brittle. You can often get the files back. You usually canno
 
 `daedalus` v1 is a repo-local, agent-aware recovery tool.
 
-It runs an agent under protection, saves checkpoints before configured unsafe actions, restores the workspace to a prior checkpoint, and reconstructs enough agent context to continue from that point.
+It runs a supported agent under protection, saves checkpoints before configured unsafe shell actions, restores the workspace to a prior checkpoint, and reconstructs enough agent context to continue from that point.
 
 The key promise is:
 
@@ -44,7 +44,7 @@ The public workflow is:
 
 1. `ddl run -- <agent command>`
 2. agent reads files, edits code, asks for approval
-3. before a risky action, `daedalus` creates a checkpoint
+3. before a configured risky shell action, `daedalus` creates a checkpoint
 4. the action goes bad
 5. `ddl restore <checkpoint_id>`
 6. workspace returns to the pre-action state
@@ -88,6 +88,7 @@ The v1 CLI is intentionally small:
 ```bash
 ddl init
 ddl run -- <agent command>
+ddl shell -- <command>
 ddl log
 ddl diff [checkpoint_a] [checkpoint_b]
 ddl restore <checkpoint_id>
@@ -98,7 +99,8 @@ ddl fork <checkpoint_id> [name]
 Command intent:
 
 - `ddl init`: initialize `daedalus` state for the repo
-- `ddl run`: execute an agent under protection and auto-checkpoint before configured unsafe actions
+- `ddl run`: execute a supported agent runtime under protection
+- `ddl shell`: execute a shell command through `daedalus`' checkpoint matcher
 - `ddl log`: inspect execution timelines and checkpoints
 - `ddl diff`: inspect file and metadata differences between checkpoints
 - `ddl restore`: return workspace and checkpoint metadata to a known point
@@ -106,6 +108,34 @@ Command intent:
 - `ddl fork`: create a new execution timeline from a checkpoint without mutating the original one
 
 Manual checkpoint commands are deliberately not in the first public story. The core value is automatic protection, not asking users to remember another save button.
+
+## Config
+
+`ddl init` writes a repo-local JSON config at `.daedalus/config.json`:
+
+```json
+{
+  "checkpointing": {
+    "before": [
+      "Edit(*)",
+      "Write(*)",
+      "Bash(npm install:*)",
+      "Bash(git rebase:*)",
+      "Bash(rm:*)",
+      "Bash(mv:*)"
+    ]
+  }
+}
+```
+
+v1 rule behavior is intentionally small:
+
+- `Bash(prefix:*)` uses deterministic argv-prefix matching
+- `Bash(command)` uses exact argv matching
+- `:*` means any trailing args
+- `Edit(*)` and `Write(*)` are accepted by the parser but not enforced yet
+
+Older repos that only have the legacy `.daedalus/config` file must be re-initialized or migrated. `daedalus` now fails clearly instead of silently skipping rule enforcement.
 
 ## Terms
 
@@ -138,7 +168,7 @@ v1 should integrate in layers.
 
 Primary:
 
-- CLI wrapper around agent processes such as `codex`, `claude`, or similar local agent CLIs
+- CLI wrapper around supported agent processes, currently `codex` and `claude`
 
 Secondary:
 
@@ -170,7 +200,7 @@ During the run:
 
 - the agent reads files and edits code
 - the agent asks for approval
-- before a risky shell command, `daedalus` creates checkpoint `cp_42`
+- before a configured shell command such as `rm -rf tmp`, `daedalus` creates checkpoint `cp_42`
 - the command goes bad
 
 Then:
@@ -217,7 +247,7 @@ Near-term extensions after the core demo:
 
 ## Status
 
-This repo now includes an initial Rust CLI scaffold for the v1 surface area described above. The implementation is intentionally base-level: it establishes the project shape, repo-local state model, command structure, and shadow git-backed checkpoint storage without claiming full hook-driven protection yet.
+This repo now includes a working shell-first v1 implementation. It keeps the repo-local state model and shadow git-backed checkpoint storage from the scaffold, but moves automatic checkpointing to wrapped mutation boundaries instead of creating checkpoints at run start.
 
 The implementation should stay anchored to the same promise:
 
@@ -225,12 +255,18 @@ protect agent runs, checkpoint before risky actions, restore cleanly, then resum
 
 ## Current Base
 
-The scaffold currently provides:
+The current base provides:
 
 - a Rust workspace with the `ddl` CLI crate
-- repo-local `.daedalus/` state initialization
+- repo-local `.daedalus/` state initialization with `.daedalus/config.json`
 - timeline, run, and checkpoint metadata records
 - shadow git-backed snapshot storage under `.daedalus/shadow/`
-- working `init`, `log`, `diff`, `restore`, `resume`, and `fork` command paths at baseline fidelity
+- `ddl run` wrapper mode for `codex` and `claude`
+- `ddl shell` for direct shell execution through the matcher
+- automatic checkpointing for configured `Bash(...)` rules
 
-The current code is a foundation, not the finished v1 product. Automatic checkpointing around specific unsafe actions, deeper transcript capture, and richer integrations remain follow-on work.
+The current enforcement surface is intentionally narrow:
+
+- `Bash(...)` rules are enforced now
+- `Edit(*)` and `Write(*)` are accepted in config for forward compatibility but not enforced yet
+- unsupported runtimes fail clearly instead of pretending they are protected

@@ -87,7 +87,7 @@ pub struct TimelineRecord {
     pub id: String,
     pub name: Option<String>,
     pub run_id: String,
-    pub root_checkpoint_id: String,
+    pub root_checkpoint_id: Option<String>,
     pub source_checkpoint_id: Option<String>,
     pub created_at: u64,
 }
@@ -99,7 +99,7 @@ impl TimelineRecord {
             id: required_value(&map, "id")?,
             name: optional_value(&map, "name"),
             run_id: required_value(&map, "run_id")?,
-            root_checkpoint_id: required_value(&map, "root_checkpoint_id")?,
+            root_checkpoint_id: optional_value(&map, "root_checkpoint_id"),
             source_checkpoint_id: optional_value(&map, "source_checkpoint_id"),
             created_at: required_value(&map, "created_at")?.parse()?,
         })
@@ -109,9 +109,11 @@ impl TimelineRecord {
         let mut pairs = vec![
             ("id", self.id.clone()),
             ("run_id", self.run_id.clone()),
-            ("root_checkpoint_id", self.root_checkpoint_id.clone()),
             ("created_at", self.created_at.to_string()),
         ];
+        if let Some(root_checkpoint_id) = &self.root_checkpoint_id {
+            pairs.push(("root_checkpoint_id", root_checkpoint_id.clone()));
+        }
         if let Some(name) = &self.name {
             pairs.push(("name", name.clone()));
         }
@@ -129,7 +131,7 @@ pub struct RunRecord {
     pub command: Vec<String>,
     pub created_at: u64,
     pub status: RunStatus,
-    pub last_checkpoint_id: String,
+    pub last_checkpoint_id: Option<String>,
     pub resumability: Resumability,
 }
 
@@ -142,7 +144,7 @@ impl RunRecord {
             command: repeated_values(&map, "arg"),
             created_at: required_value(&map, "created_at")?.parse()?,
             status: RunStatus::parse(&required_value(&map, "status")?)?,
-            last_checkpoint_id: required_value(&map, "last_checkpoint_id")?,
+            last_checkpoint_id: optional_value(&map, "last_checkpoint_id"),
             resumability: Resumability::parse(&required_value(&map, "resumability")?)?,
         })
     }
@@ -153,9 +155,11 @@ impl RunRecord {
             ("timeline_id", self.timeline_id.clone()),
             ("created_at", self.created_at.to_string()),
             ("status", self.status.as_str().to_string()),
-            ("last_checkpoint_id", self.last_checkpoint_id.clone()),
             ("resumability", self.resumability.as_str().to_string()),
         ];
+        if let Some(last_checkpoint_id) = &self.last_checkpoint_id {
+            pairs.push(("last_checkpoint_id", last_checkpoint_id.clone()));
+        }
         for arg in &self.command {
             pairs.push(("arg", arg.clone()));
         }
@@ -174,6 +178,9 @@ pub struct CheckpointRecord {
     pub shadow_commit: String,
     pub created_at: u64,
     pub resumability: Resumability,
+    pub trigger_tool_type: Option<String>,
+    pub trigger_command: Option<String>,
+    pub runtime_name: Option<String>,
     pub fingerprint: RuntimeFingerprint,
 }
 
@@ -190,6 +197,9 @@ impl CheckpointRecord {
             shadow_commit: required_value(&map, "shadow_commit")?,
             created_at: required_value(&map, "created_at")?.parse()?,
             resumability: Resumability::parse(&required_value(&map, "resumability")?)?,
+            trigger_tool_type: optional_value(&map, "trigger_tool_type"),
+            trigger_command: optional_value(&map, "trigger_command"),
+            runtime_name: optional_value(&map, "runtime_name"),
             fingerprint: RuntimeFingerprint {
                 cwd: required_value(&map, "cwd")?,
                 repo_root: required_value(&map, "repo_root")?,
@@ -220,6 +230,15 @@ impl CheckpointRecord {
         ];
         if let Some(parent) = &self.parent_checkpoint_id {
             pairs.push(("parent_checkpoint_id", parent.clone()));
+        }
+        if let Some(trigger_tool_type) = &self.trigger_tool_type {
+            pairs.push(("trigger_tool_type", trigger_tool_type.clone()));
+        }
+        if let Some(trigger_command) = &self.trigger_command {
+            pairs.push(("trigger_command", trigger_command.clone()));
+        }
+        if let Some(runtime_name) = &self.runtime_name {
+            pairs.push(("runtime_name", runtime_name.clone()));
         }
         write_pairs(path, &pairs)
     }
