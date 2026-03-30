@@ -1,1 +1,222 @@
 # daedalus
+
+`daedalus` is a checkpointing layer for coding agents.
+
+It is built for the moment right before an agent does something unsafe, and for the moment right after you realize it was a mistake.
+
+The goal is simple: restore the exact repo/workspace state and the agent context immediately before a risky action, then either continue the same timeline or fork a new one.
+
+## The Problem
+
+Coding agents are no longer one-shot chats. They read files, edit code, install dependencies, run shell commands, ask for approvals, and carry plan state across long sessions.
+
+When something goes wrong, git is usually not the right recovery primitive:
+
+- the bad action may happen between commits
+- you may not want to create noisy commits just to stay safe
+- the damage may include more than source edits
+- the agent's reasoning context matters, not just the diff
+
+Today the relevant state is scattered across too many places:
+
+- working tree changes
+- generated files and local artifacts
+- tool outputs the agent already consumed
+- approval history
+- conversation and plan state
+- shell actions and their results
+
+That makes recovery brittle. You can often get the files back. You usually cannot get back to the exact decision point cleanly.
+
+## What v1 Is
+
+`daedalus` v1 is a repo-local, agent-aware recovery tool.
+
+It runs an agent under protection, saves checkpoints before configured unsafe actions, restores the workspace to a prior checkpoint, and reconstructs enough agent context to continue from that point.
+
+The key promise is:
+
+> Restore the exact repo/workspace state and the agent context immediately before a risky action, then resume or fork from there.
+
+## Core Workflow
+
+The public workflow is:
+
+1. `ddl run -- <agent command>`
+2. agent reads files, edits code, asks for approval
+3. before a risky action, `daedalus` creates a checkpoint
+4. the action goes bad
+5. `ddl restore <checkpoint_id>`
+6. workspace returns to the pre-action state
+7. `ddl resume <checkpoint_id>` or `ddl fork <checkpoint_id> [name]`
+8. the agent continues from the saved context
+
+This is why v1 is CLI-first. `daedalus` needs to own or observe the run in order to protect it properly.
+
+## What v1 Stores
+
+A checkpoint is not just a file diff.
+
+For v1, a checkpoint is expected to include:
+
+- workspace snapshot for the configured scope
+- conversation transcript or transcript pointer owned by the wrapper/integration
+- plan or todo state, if present
+- tool outputs the agent has already seen
+- approval history
+- runtime fingerprint such as cwd, git HEAD/dirty state, selected environment, and relevant tool versions
+
+The point is not to save everything the machine knows. The point is to save the minimum state needed to recreate what the agent knew and what the repo looked like immediately before a risky action.
+
+## What v1 Does Not Do
+
+v1 is intentionally narrow.
+
+It is not:
+
+- a replacement for git
+- a full VM or container snapshot product
+- a promise to rewind arbitrary external side effects outside the configured workspace
+- a promise to mutate any vendor chat UI back in place
+
+`daedalus` restores agent context for resumption. That is different from universally rewinding an existing Codex or Claude thread inside a host UI.
+
+## Commands
+
+The v1 CLI is intentionally small:
+
+```bash
+ddl init
+ddl run -- <agent command>
+ddl log
+ddl diff [checkpoint_a] [checkpoint_b]
+ddl restore <checkpoint_id>
+ddl resume <checkpoint_id>
+ddl fork <checkpoint_id> [name]
+```
+
+Command intent:
+
+- `ddl init`: initialize `daedalus` state for the repo
+- `ddl run`: execute an agent under protection and auto-checkpoint before configured unsafe actions
+- `ddl log`: inspect execution timelines and checkpoints
+- `ddl diff`: inspect file and metadata differences between checkpoints
+- `ddl restore`: return workspace and checkpoint metadata to a known point
+- `ddl resume`: continue the same timeline from a checkpoint using saved agent context
+- `ddl fork`: create a new execution timeline from a checkpoint without mutating the original one
+
+Manual checkpoint commands are deliberately not in the first public story. The core value is automatic protection, not asking users to remember another save button.
+
+## Terms
+
+- `checkpoint`: a saved execution point before an unsafe action
+- `restore`: return workspace and checkpoint metadata to that point
+- `resume`: continue the same execution timeline from that checkpoint
+- `fork`: create a new execution timeline from that checkpoint
+- `timeline`: the ordered history of checkpoints for one protected run
+
+`fork` is intentionally not called `branch` in the public interface. A git branch points to source history. A `daedalus` fork represents execution history.
+
+## How It Works
+
+The implementation goal is a repo-local hidden state store with content-addressed semantics and cheap checkpointing, diffing, restore, and forking.
+
+The exact storage internals can evolve. Using git primitives or a shadow git repository internally is acceptable. That is an implementation detail, not the product model.
+
+The user model should stay simple:
+
+- protected runs
+- checkpoints
+- restore
+- resume
+- forks
+- timelines
+
+## Integration Model
+
+v1 should integrate in layers.
+
+Primary:
+
+- CLI wrapper around agent processes such as `codex`, `claude`, or similar local agent CLIs
+
+Secondary:
+
+- MCP server exposing checkpoint tools to agents explicitly
+
+Tertiary:
+
+- agent-specific hooks where supported for automatic checkpointing around tool execution
+
+MCP matters because it lets agents call `restore`, `resume`, `fork`, `diff`, and `log` as first-class tools.
+
+But MCP alone is not enough. The core value of `daedalus` is automatic protection before a risky action, which usually requires a wrapper or a hook surface.
+
+Full `resume` fidelity depends on `daedalus` owning or observing the run. If the agent was not run through `daedalus` or a supported integration, file restore may still work while resume is partial or unavailable.
+
+## Demo Story
+
+The first demo should prove one thing clearly:
+
+An agent can make progress, take a bad action, and be brought back to the exact pre-action point without relying on git commits.
+
+Example:
+
+```bash
+ddl run -- codex ...
+```
+
+During the run:
+
+- the agent reads files and edits code
+- the agent asks for approval
+- before a risky shell command, `daedalus` creates checkpoint `cp_42`
+- the command goes bad
+
+Then:
+
+```bash
+ddl restore cp_42
+ddl resume cp_42
+```
+
+Or, if the user wants an alternate path:
+
+```bash
+ddl fork cp_42 alt-fix
+```
+
+That is the product in one sequence.
+
+## Why Rust
+
+Rust fits the shape of this tool well:
+
+- fast filesystem and process work
+- strong control over storage and serialization
+- easy distribution as a single binary
+- good fit for a long-lived local systems tool
+
+The main risk is not language choice. The main risk is scope. v1 only works if it stays narrow and credible.
+
+## Roadmap
+
+Near-term extensions after the core demo:
+
+- MCP server backed by the same core engine
+- hook-based integrations for supported agent runtimes
+- richer checkpoint diff views across files, approvals, and tool outputs
+- explicit export or sync flows into git when users want to turn a recovered timeline into source history
+
+## Non-Goals for v1
+
+- full machine snapshotting
+- universal rollback of external side effects
+- replacing git branches or commits
+- deep vendor-specific promises that depend on undocumented rewind capabilities
+
+## Status
+
+This repo currently captures the v1 vision and product shape. The implementation should stay anchored to that promise:
+
+protect agent runs, checkpoint before risky actions, restore cleanly, then resume or fork from the exact decision point.
