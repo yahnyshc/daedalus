@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::Read;
 
 use crate::error::{DdlError, Result};
@@ -238,12 +239,18 @@ fn resolve_diff_targets(
 }
 
 fn print_log(store: &DaedalusStore) -> Result<()> {
+    print!("{}", render_log(store)?);
+    Ok(())
+}
+
+fn render_log(store: &DaedalusStore) -> Result<String> {
     let timelines = store.list_timelines()?;
     let checkpoints = store.list_checkpoints()?;
+    let mut output = String::new();
 
     if timelines.is_empty() {
-        println!("no timelines recorded");
-        return Ok(());
+        output.push_str("no timelines recorded\n");
+        return Ok(output);
     }
 
     for timeline in timelines {
@@ -252,15 +259,15 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
             .as_deref()
             .map(|name| format!(" ({name})"))
             .unwrap_or_default();
-        println!("timeline {}{}", timeline.id, label);
-        println!("  run: {}", timeline.run_id);
+        let _ = writeln!(output, "timeline {}{}", timeline.id, label);
+        let _ = writeln!(output, "  run: {}", timeline.run_id);
         if let Some(root_checkpoint_id) = &timeline.root_checkpoint_id {
-            println!("  root checkpoint: {root_checkpoint_id}");
+            let _ = writeln!(output, "  root checkpoint: {root_checkpoint_id}");
         } else {
-            println!("  root checkpoint: none yet");
+            output.push_str("  root checkpoint: none yet\n");
         }
         if let Some(source) = &timeline.source_checkpoint_id {
-            println!("  source checkpoint: {source}");
+            let _ = writeln!(output, "  source checkpoint: {source}");
         }
 
         for checkpoint in checkpoints
@@ -272,14 +279,27 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
                 .as_deref()
                 .map(|command| format!(" ({command})"))
                 .unwrap_or_default();
-            println!(
+            let claude_resume = match (
+                checkpoint.runtime_name.as_deref(),
+                checkpoint.resumability.as_str(),
+            ) {
+                (Some("claude"), "full") => " [Claude resume: available]",
+                (Some("claude"), "partial") => " [Claude resume: missing]",
+                (Some("claude"), "unavailable") => " [Claude resume: unavailable]",
+                _ => "",
+            };
+            let _ = writeln!(
+                output,
                 "  checkpoint {} [{}] {}{}",
                 checkpoint.id, checkpoint.resumability, checkpoint.reason, trigger
             );
+            if !claude_resume.is_empty() {
+                let _ = writeln!(output, "    {}", claude_resume.trim());
+            }
         }
     }
 
-    Ok(())
+    Ok(output)
 }
 
 fn print_help() {
@@ -298,4 +318,98 @@ Usage:
   ddl fork <checkpoint_id> [name]
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use crate::model::{
+        CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint, TimelineRecord,
+    };
+    use crate::store::DaedalusStore;
+
+    use super::render_log;
+
+    #[test]
+    fn log_surfaces_claude_resume_availability() {
+        let repo_root = create_temp_repo("app-log");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let created_at = 1;
+        TimelineRecord {
+            id: "tl_test".to_string(),
+            name: Some("main".to_string()),
+            run_id: "run_test".to_string(),
+            root_checkpoint_id: Some("cp_test".to_string()),
+            source_checkpoint_id: None,
+            created_at,
+        }
+        .write(&repo_root.join(".daedalus/timelines/tl_test.meta"))
+        .expect("write timeline");
+        RunRecord {
+            id: "run_test".to_string(),
+            timeline_id: "tl_test".to_string(),
+            command: vec!["claude".to_string()],
+            created_at,
+            status: RunStatus::Running,
+            last_checkpoint_id: Some("cp_test".to_string()),
+            resumability: Resumability::Full,
+        }
+        .write(&repo_root.join(".daedalus/runs/run_test.meta"))
+        .expect("write run");
+        let snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_test");
+        fs::create_dir_all(&snapshot_path).expect("create snapshot");
+        CheckpointRecord {
+            id: "cp_test".to_string(),
+            timeline_id: "tl_test".to_string(),
+            run_id: "run_test".to_string(),
+            parent_checkpoint_id: None,
+            reason: "before-edit".to_string(),
+            snapshot_rel_path: "snapshots/cp_test".to_string(),
+            shadow_commit: "deadbeef".to_string(),
+            created_at,
+            resumability: Resumability::Partial,
+            trigger_tool_type: Some("edit".to_string()),
+            trigger_command: Some("src/main.rs".to_string()),
+            runtime_name: Some("claude".to_string()),
+            claude_session_id: None,
+            fingerprint: RuntimeFingerprint {
+                cwd: repo_root.display().to_string(),
+                repo_root: repo_root.display().to_string(),
+                git_head: "deadbeef".to_string(),
+                git_branch: "main".to_string(),
+                git_dirty: false,
+                git_version: "git version".to_string(),
+            },
+        }
+        .write(&repo_root.join(".daedalus/checkpoints/cp_test.meta"))
+        .expect("write checkpoint");
+
+        let output = render_log(&store).expect("render log");
+        assert!(output.contains("checkpoint cp_test [partial] before-edit (src/main.rs)"));
+        assert!(output.contains("Claude resume: missing"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    fn create_temp_repo(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ddl-app-test-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp repo");
+        Command::new("git")
+            .arg("init")
+            .arg(&path)
+            .output()
+            .expect("git init");
+        path
+    }
 }

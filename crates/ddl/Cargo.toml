@@ -13,3 +13,5 @@ path = "src/lib.rs"
 name = "ddl"
 path = "src/main.rs"
 
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
