@@ -302,12 +302,19 @@ impl DaedalusStore {
         Ok(0)
     }
 
-    pub fn resume(&self, checkpoint_id: &str) -> Result<i32> {
+    pub fn rewind(&self, checkpoint_id: &str) -> Result<i32> {
         self.ensure_initialized()?;
         let checkpoint = self.read_checkpoint(checkpoint_id)?;
         if checkpoint.resumability == Resumability::Unavailable {
             return Err(DdlError::InvalidInput(format!(
-                "checkpoint `{checkpoint_id}` cannot be resumed"
+                "checkpoint `{checkpoint_id}` cannot be rewound: workspace restore is unavailable"
+            )));
+        }
+        if checkpoint.runtime_name.as_deref() == Some("claude")
+            && checkpoint.resumability != Resumability::Full
+        {
+            return Err(DdlError::InvalidInput(format!(
+                "checkpoint `{checkpoint_id}` cannot be rewound: agent context is unavailable; use `ddl restore {checkpoint_id}` for repo-only recovery"
             )));
         }
 
@@ -319,23 +326,24 @@ impl DaedalusStore {
         self.write_run(&run)?;
 
         let runtime = SupportedRuntime::detect(&run.command).ok();
-        let mut resume_command = run.command.clone();
+        let mut rewind_command = run.command.clone();
         if runtime.is_some() {
             self.load_config()?;
         }
-        let shell_context = runtime.map(|runtime| {
+        let shell_context = runtime
+            .map(|runtime| {
             if runtime == SupportedRuntime::Claude {
                 match self.restore_claude_local_state(&checkpoint) {
                     Ok(ClaudeLocalRestoreOutcome::Restored) => {}
                     Ok(ClaudeLocalRestoreOutcome::NativeFallback { reason }) => {
-                        eprintln!(
-                            "warning: experimental Claude rewind skipped for checkpoint `{}`: {reason}; falling back to native session resume",
-                            checkpoint.id
-                        );
+                        return Err(DdlError::InvalidInput(format!(
+                            "checkpoint `{}` cannot be rewound: {reason}; use `ddl restore {}` for repo-only recovery",
+                            checkpoint.id, checkpoint.id
+                        )));
                     }
                     Err(error) => return Err(error),
                 }
-                resume_command = self.claude_resume_command(&run.command, &checkpoint);
+                rewind_command = self.claude_resume_command(&run.command, &checkpoint);
             }
 
             Ok(ShellWrapperContext {
@@ -344,9 +352,10 @@ impl DaedalusStore {
                 runtime,
                 claude_session_id: None,
             })
-        }).transpose()?;
+        })
+            .transpose()?;
 
-        let status = self.execute_owned_command(&resume_command, shell_context.as_ref())?;
+        let status = self.execute_owned_command(&rewind_command, shell_context.as_ref())?;
         run.status = if status.success() {
             RunStatus::Succeeded
         } else {
@@ -1050,7 +1059,7 @@ impl DaedalusStore {
             .filter(|value| Self::is_valid_claude_session_id(value))
         else {
             return Err(DdlError::InvalidInput(format!(
-                "checkpoint `{}` cannot be resumed: missing Claude session id",
+                "checkpoint `{}` cannot be rewound: missing Claude session id",
                 checkpoint.id
             )));
         };
@@ -1227,7 +1236,7 @@ impl DaedalusStore {
         }
 
         Ok(Some(
-            "live Claude files were rolled back cleanly before native resume".to_string(),
+            "live Claude files were rolled back cleanly before rewind aborted".to_string(),
         ))
     }
 
@@ -1995,7 +2004,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_resume_restores_saved_local_state_before_resume_and_replaces_targets() {
+    fn claude_rewind_restores_saved_local_state_before_launch_and_replaces_targets() {
         let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-resume");
         let home_dir = create_temp_home("claude-resume");
@@ -2066,7 +2075,7 @@ mod tests {
             ],
         );
         fs::remove_file(&args_path).ok();
-        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        let exit_code = store.rewind(&checkpoint.id).expect("rewind checkpoint");
         std::env::set_current_dir(previous).expect("restore cwd");
         restore_home(previous_home);
 
@@ -2099,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_resume_uses_native_session_when_rewind_snapshot_is_missing() {
+    fn claude_rewind_fails_when_agent_context_is_unavailable() {
         let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-resume-partial");
         let home_dir = create_temp_home("claude-resume-partial");
@@ -2142,23 +2151,26 @@ mod tests {
             )
             .expect("create checkpoint");
         fs::remove_file(&args_path).ok();
-        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        let error = store
+            .rewind(&checkpoint.id)
+            .expect_err("rewind should fail without agent context");
         std::env::set_current_dir(previous).expect("restore cwd");
         restore_home(previous_home);
 
         assert_eq!(checkpoint.resumability, Resumability::Partial);
-        assert_eq!(exit_code, 0);
-        let args = fs::read_to_string(&args_path).expect("read agent args");
-        assert!(args.contains("--resume"));
-        assert!(args.contains(&session_id));
-        assert!(!args.contains("fresh prompt"));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be rewound: agent context is unavailable")
+        );
+        assert!(!args_path.exists());
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
         fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
     #[test]
-    fn non_claude_resume_keeps_existing_behavior() {
+    fn non_claude_rewind_keeps_existing_behavior() {
         let _guard = lock_tests();
         let repo_root = create_temp_repo("codex-resume");
 
@@ -2189,7 +2201,7 @@ mod tests {
             )
             .expect("create checkpoint");
         fs::remove_file(&args_path).ok();
-        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        let exit_code = store.rewind(&checkpoint.id).expect("rewind checkpoint");
         std::env::set_current_dir(previous).expect("restore cwd");
 
         assert_eq!(exit_code, 0);

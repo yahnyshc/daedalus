@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 use crate::error::{DdlError, Result};
+use crate::model::Resumability;
 use crate::store::DaedalusStore;
 
 pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
@@ -73,9 +74,9 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             println!("restored workspace to checkpoint {checkpoint}");
             Ok(0)
         }
-        CommandLine::Resume { checkpoint } => {
+        CommandLine::Rewind { checkpoint } => {
             let store = DaedalusStore::discover()?;
-            store.resume(&checkpoint)
+            store.rewind(&checkpoint)
         }
         CommandLine::Fork { checkpoint, name } => {
             let store = DaedalusStore::discover()?;
@@ -86,6 +87,7 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
     }
 }
 
+#[derive(Debug)]
 enum CommandLine {
     Help,
     Init,
@@ -104,7 +106,7 @@ enum CommandLine {
     Restore {
         checkpoint: String,
     },
-    Resume {
+    Rewind {
         checkpoint: String,
     },
     Fork {
@@ -133,9 +135,11 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         "diff" => parse_diff(parts),
         "restore" => parse_single_value(parts, "restore")
             .map(|checkpoint| CommandLine::Restore { checkpoint }),
-        "resume" => {
-            parse_single_value(parts, "resume").map(|checkpoint| CommandLine::Resume { checkpoint })
-        }
+        "rewind" => parse_single_value(parts, "rewind")
+            .map(|checkpoint| CommandLine::Rewind { checkpoint }),
+        "resume" => Err(DdlError::InvalidInput(
+            "`ddl resume` was removed; use `ddl rewind <checkpoint_id>` for agent-context rewind or `ddl restore <checkpoint_id>` for repo-only recovery".to_string(),
+        )),
         "fork" => {
             if parts.len() < 3 {
                 return Err(DdlError::InvalidInput(
@@ -279,23 +283,26 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
                 .as_deref()
                 .map(|command| format!(" ({command})"))
                 .unwrap_or_default();
-            let claude_rewind = match (
+            let _ = writeln!(
+                output,
+                "  checkpoint {} {}{}",
+                checkpoint.id, checkpoint.reason, trigger
+            );
+            let restore_status = match checkpoint.resumability {
+                Resumability::Unavailable => "Restore: unavailable",
+                _ => "Restore: available",
+            };
+            let rewind_status = match (
                 checkpoint.runtime_name.as_deref(),
                 checkpoint.resumability.as_str(),
             ) {
-                (Some("claude"), "full") => " [Claude rewind: available]",
-                (Some("claude"), "partial") => " [Claude rewind: native session only]",
-                (Some("claude"), "unavailable") => " [Claude rewind: unavailable]",
-                _ => "",
+                (_, "unavailable") => "Rewind: unavailable",
+                (Some("claude"), "full") => "Rewind: available",
+                (Some("claude"), "partial") => "Rewind: unavailable (restore only)",
+                _ => "Rewind: available",
             };
-            let _ = writeln!(
-                output,
-                "  checkpoint {} [{}] {}{}",
-                checkpoint.id, checkpoint.resumability, checkpoint.reason, trigger
-            );
-            if !claude_rewind.is_empty() {
-                let _ = writeln!(output, "    {}", claude_rewind.trim());
-            }
+            let _ = writeln!(output, "    {restore_status}");
+            let _ = writeln!(output, "    {rewind_status}");
         }
     }
 
@@ -314,7 +321,7 @@ Usage:
   ddl log
   ddl diff [checkpoint_a] [checkpoint_b]
   ddl restore <checkpoint_id>
-  ddl resume <checkpoint_id>
+  ddl rewind <checkpoint_id>
   ddl fork <checkpoint_id> [name]
 "
     );
@@ -322,6 +329,7 @@ Usage:
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -331,7 +339,7 @@ mod tests {
     };
     use crate::store::DaedalusStore;
 
-    use super::render_log;
+    use super::{CommandLine, parse_arguments, render_log};
 
     #[test]
     fn log_surfaces_claude_rewind_availability() {
@@ -420,12 +428,39 @@ mod tests {
         .expect("write full checkpoint");
 
         let output = render_log(&store).expect("render log");
-        assert!(output.contains("checkpoint cp_test [partial] before-edit (src/main.rs)"));
-        assert!(output.contains("Claude rewind: native session only"));
-        assert!(output.contains("checkpoint cp_full [full] before-shell (rm README.md)"));
-        assert!(output.contains("Claude rewind: available"));
+        assert!(output.contains("checkpoint cp_test before-edit (src/main.rs)"));
+        assert!(output.contains("Restore: available"));
+        assert!(output.contains("Rewind: unavailable (restore only)"));
+        assert!(output.contains("checkpoint cp_full before-shell (rm README.md)"));
+        assert!(output.contains("Rewind: available"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn parse_arguments_accepts_rewind_and_rejects_resume() {
+        match parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("rewind"),
+            OsString::from("cp_test"),
+        ])
+        .expect("parse rewind")
+        {
+            CommandLine::Rewind { checkpoint } => assert_eq!(checkpoint, "cp_test"),
+            _ => panic!("expected rewind command"),
+        }
+
+        let error = parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("resume"),
+            OsString::from("cp_test"),
+        ])
+        .expect_err("resume should be removed");
+        assert!(
+            error
+                .to_string()
+                .contains("`ddl resume` was removed; use `ddl rewind <checkpoint_id>`")
+        );
     }
 
     fn create_temp_repo(name: &str) -> PathBuf {
