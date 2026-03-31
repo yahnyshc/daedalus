@@ -168,6 +168,30 @@ impl RunRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeMetadataRecord {
+    pub runtime_name: String,
+    pub claude_session_id: Option<String>,
+}
+
+impl RuntimeMetadataRecord {
+    pub fn read(path: &Path) -> Result<Self> {
+        let map = read_pairs(path)?;
+        Ok(Self {
+            runtime_name: required_value(&map, "runtime_name")?,
+            claude_session_id: optional_value(&map, "claude_session_id"),
+        })
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let mut pairs = vec![("runtime_name", self.runtime_name.clone())];
+        if let Some(claude_session_id) = &self.claude_session_id {
+            pairs.push(("claude_session_id", claude_session_id.clone()));
+        }
+        write_pairs(path, &pairs)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointRecord {
     pub id: String,
     pub timeline_id: String,
@@ -181,6 +205,7 @@ pub struct CheckpointRecord {
     pub trigger_tool_type: Option<String>,
     pub trigger_command: Option<String>,
     pub runtime_name: Option<String>,
+    pub claude_session_id: Option<String>,
     pub fingerprint: RuntimeFingerprint,
 }
 
@@ -200,6 +225,7 @@ impl CheckpointRecord {
             trigger_tool_type: optional_value(&map, "trigger_tool_type"),
             trigger_command: optional_value(&map, "trigger_command"),
             runtime_name: optional_value(&map, "runtime_name"),
+            claude_session_id: optional_value(&map, "claude_session_id"),
             fingerprint: RuntimeFingerprint {
                 cwd: required_value(&map, "cwd")?,
                 repo_root: required_value(&map, "repo_root")?,
@@ -239,6 +265,9 @@ impl CheckpointRecord {
         }
         if let Some(runtime_name) = &self.runtime_name {
             pairs.push(("runtime_name", runtime_name.clone()));
+        }
+        if let Some(claude_session_id) = &self.claude_session_id {
+            pairs.push(("claude_session_id", claude_session_id.clone()));
         }
         write_pairs(path, &pairs)
     }

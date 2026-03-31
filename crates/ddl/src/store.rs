@@ -9,12 +9,14 @@ use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, ToolI
 use crate::error::{DdlError, Result};
 use crate::ids::next_id;
 use crate::model::{
-    CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint, TimelineRecord,
+    CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
+    RuntimeMetadataRecord, TimelineRecord,
 };
 use crate::runtime::{
     ENV_REAL_SHELL, ShellWrapperContext, SupportedRuntime, apply_runtime_environment,
     current_shell_context, prepare_runtime_command,
 };
+use uuid::Uuid;
 
 const STATE_DIR: &str = ".daedalus";
 const SNAPSHOT_DIR_NAME: &str = "snapshots";
@@ -166,14 +168,22 @@ impl DaedalusStore {
             created_at,
             status: RunStatus::Running,
             last_checkpoint_id: None,
-            resumability: Resumability::Full,
+            resumability: self.initial_run_resumability(runtime),
         };
         self.write_run(&run)?;
+        let runtime_metadata = self.initialize_runtime_metadata(&run_id, runtime)?;
+        if runtime == SupportedRuntime::Claude && runtime_metadata.is_some() {
+            run.resumability = Resumability::Full;
+            self.write_run(&run)?;
+        }
 
         let shell_context = ShellWrapperContext {
             run_id: run_id.clone(),
             timeline_id: timeline_id.clone(),
             runtime,
+            claude_session_id: runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.claude_session_id.clone()),
         };
         let status = self.execute_owned_command(&command, Some(&shell_context))?;
 
@@ -290,16 +300,24 @@ impl DaedalusStore {
         self.write_run(&run)?;
 
         let runtime = SupportedRuntime::detect(&run.command).ok();
+        let mut resume_command = run.command.clone();
         if runtime.is_some() {
             self.load_config()?;
         }
-        let shell_context = runtime.map(|runtime| ShellWrapperContext {
-            run_id: run.id.clone(),
-            timeline_id: checkpoint.timeline_id.clone(),
-            runtime,
+        let shell_context = runtime.map(|runtime| {
+            if runtime == SupportedRuntime::Claude {
+                resume_command = self.claude_resume_command(&run.command, &checkpoint);
+            }
+
+            ShellWrapperContext {
+                run_id: run.id.clone(),
+                timeline_id: checkpoint.timeline_id.clone(),
+                runtime,
+                claude_session_id: None,
+            }
         });
 
-        let status = self.execute_owned_command(&run.command, shell_context.as_ref())?;
+        let status = self.execute_owned_command(&resume_command, shell_context.as_ref())?;
         run.status = if status.success() {
             RunStatus::Succeeded
         } else {
@@ -342,7 +360,7 @@ impl DaedalusStore {
             created_at: unix_timestamp(),
             status: RunStatus::Forked,
             last_checkpoint_id: Some(checkpoint.id),
-            resumability: Resumability::Full,
+            resumability: checkpoint.resumability.clone(),
         };
         self.write_run(&run)?;
 
@@ -419,7 +437,8 @@ impl DaedalusStore {
         self.ensure_initialized()?;
         let mut items = Vec::new();
         for path in list_meta_files(&self.checkpoints_dir)? {
-            items.push(CheckpointRecord::read(&path)?);
+            let checkpoint = CheckpointRecord::read(&path)?;
+            items.push(self.with_live_resumability(checkpoint));
         }
         items.sort_by_key(|item| item.created_at);
         Ok(items)
@@ -455,7 +474,7 @@ impl DaedalusStore {
                 id: checkpoint_id.to_string(),
             });
         }
-        CheckpointRecord::read(&path)
+        Ok(self.with_live_resumability(CheckpointRecord::read(&path)?))
     }
 
     fn load_config(&self) -> Result<DaedalusConfig> {
@@ -482,6 +501,14 @@ impl DaedalusStore {
 
     fn write_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<()> {
         checkpoint.write(&self.checkpoints_dir.join(format!("{}.meta", checkpoint.id)))
+    }
+
+    fn write_runtime_metadata(&self, run_id: &str, metadata: &RuntimeMetadataRecord) -> Result<()> {
+        let path = self.runtime_metadata_path(run_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        metadata.write(&path)
     }
 
     fn create_standalone_shell_run(&self, command: &[String]) -> Result<StandaloneShellRun> {
@@ -514,6 +541,39 @@ impl DaedalusStore {
             timeline_id,
             run_id,
         })
+    }
+
+    fn initial_run_resumability(&self, runtime: SupportedRuntime) -> Resumability {
+        match runtime {
+            SupportedRuntime::Claude => Resumability::Partial,
+            SupportedRuntime::Codex => Resumability::Full,
+        }
+    }
+
+    fn initialize_runtime_metadata(
+        &self,
+        run_id: &str,
+        runtime: SupportedRuntime,
+    ) -> Result<Option<RuntimeMetadataRecord>> {
+        match runtime {
+            SupportedRuntime::Claude => {
+                let metadata = RuntimeMetadataRecord {
+                    runtime_name: runtime.as_str().to_string(),
+                    claude_session_id: Some(Uuid::new_v4().to_string()),
+                };
+                self.write_runtime_metadata(run_id, &metadata)?;
+                Ok(Some(metadata))
+            }
+            SupportedRuntime::Codex => Ok(None),
+        }
+    }
+
+    fn read_runtime_metadata(&self, run_id: &str) -> Result<Option<RuntimeMetadataRecord>> {
+        let path = self.runtime_metadata_path(run_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(RuntimeMetadataRecord::read(&path)?))
     }
 
     fn record_tool_checkpoint(
@@ -615,6 +675,18 @@ impl DaedalusStore {
         }
         fs::create_dir_all(&snapshot_path)?;
         copy_workspace_to_snapshot(&self.repo_root, &snapshot_path)?;
+        let runtime = self.runtime_for_run(run_id);
+        let runtime_name = trigger
+            .runtime_name
+            .clone()
+            .or_else(|| runtime.map(|runtime| runtime.as_str().to_string()));
+        let claude_session_id = match runtime {
+            Some(SupportedRuntime::Claude) => self
+                .read_runtime_metadata(run_id)?
+                .and_then(|metadata| metadata.claude_session_id)
+                .filter(|value| Self::is_valid_claude_session_id(value)),
+            _ => None,
+        };
 
         run_command(
             Command::new("git")
@@ -658,10 +730,15 @@ impl DaedalusStore {
             snapshot_rel_path,
             shadow_commit,
             created_at: unix_timestamp(),
-            resumability: Resumability::Full,
+            resumability: self.compute_checkpoint_resumability(
+                &snapshot_path,
+                runtime_name.as_deref(),
+                claude_session_id.as_deref(),
+            ),
             trigger_tool_type: trigger.tool_type,
             trigger_command: trigger.command,
-            runtime_name: trigger.runtime_name,
+            runtime_name,
+            claude_session_id,
             fingerprint: self.capture_fingerprint()?,
         };
         self.write_checkpoint(&checkpoint)?;
@@ -725,10 +802,15 @@ impl DaedalusStore {
             snapshot_rel_path,
             shadow_commit,
             created_at: unix_timestamp(),
-            resumability: Resumability::Full,
+            resumability: self.compute_checkpoint_resumability(
+                &new_snapshot,
+                source.runtime_name.as_deref(),
+                source.claude_session_id.as_deref(),
+            ),
             trigger_tool_type: None,
             trigger_command: None,
-            runtime_name: None,
+            runtime_name: source.runtime_name.clone(),
+            claude_session_id: source.claude_session_id.clone(),
             fingerprint: source.fingerprint.clone(),
         };
         self.write_checkpoint(&checkpoint)?;
@@ -777,6 +859,69 @@ impl DaedalusStore {
 
     fn snapshot_path(&self, relative: &str) -> PathBuf {
         self.shadow_dir.join(relative)
+    }
+
+    fn runtime_metadata_path(&self, run_id: &str) -> PathBuf {
+        self.state_dir
+            .join("runtime")
+            .join(run_id)
+            .join("session.meta")
+    }
+
+    fn runtime_for_run(&self, run_id: &str) -> Option<SupportedRuntime> {
+        self.read_run(run_id)
+            .ok()
+            .and_then(|run| SupportedRuntime::detect(&run.command).ok())
+    }
+
+    fn with_live_resumability(&self, mut checkpoint: CheckpointRecord) -> CheckpointRecord {
+        let snapshot_path = self.snapshot_path(&checkpoint.snapshot_rel_path);
+        checkpoint.resumability = self.compute_checkpoint_resumability(
+            &snapshot_path,
+            checkpoint.runtime_name.as_deref(),
+            checkpoint.claude_session_id.as_deref(),
+        );
+        checkpoint
+    }
+
+    fn compute_checkpoint_resumability(
+        &self,
+        snapshot_path: &Path,
+        runtime_name: Option<&str>,
+        claude_session_id: Option<&str>,
+    ) -> Resumability {
+        if !snapshot_path.exists() {
+            return Resumability::Unavailable;
+        }
+
+        if runtime_name == Some("claude")
+            && !claude_session_id.is_some_and(Self::is_valid_claude_session_id)
+        {
+            return Resumability::Partial;
+        }
+
+        Resumability::Full
+    }
+
+    fn claude_resume_command(
+        &self,
+        original_command: &[String],
+        checkpoint: &CheckpointRecord,
+    ) -> Vec<String> {
+        let session_id = checkpoint
+            .claude_session_id
+            .as_deref()
+            .filter(|value| Self::is_valid_claude_session_id(value))
+            .unwrap_or_default();
+        vec![
+            original_command[0].clone(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ]
+    }
+
+    fn is_valid_claude_session_id(value: &str) -> bool {
+        Uuid::parse_str(value).is_ok()
     }
 }
 
@@ -914,11 +1059,14 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
 
     use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON};
+    use crate::model::{Resumability, RunRecord, RunStatus, RuntimeMetadataRecord, TimelineRecord};
     use crate::runtime::{ENV_RUN_ID, ENV_RUNTIME, ENV_TIMELINE_ID};
 
     use super::DaedalusStore;
@@ -1268,6 +1416,220 @@ mod tests {
     }
 
     #[test]
+    fn claude_run_persists_session_metadata_and_injects_session_id() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("claude-run-session");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("claude-run-args.txt");
+        let command = vec![create_fake_agent_script(&repo_root, "claude", &args_path)];
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let result = store.run_agent(command).expect("run agent");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        let metadata = store
+            .read_runtime_metadata(&result.run_id)
+            .expect("read runtime metadata")
+            .expect("runtime metadata");
+        let session_id = metadata
+            .claude_session_id
+            .clone()
+            .expect("claude session id");
+        assert!(super::DaedalusStore::is_valid_claude_session_id(
+            &session_id
+        ));
+
+        let args = fs::read_to_string(&args_path).expect("read agent args");
+        assert!(args.contains("--settings"));
+        assert!(args.contains("--session-id"));
+        assert!(args.contains(&session_id));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn claude_checkpoint_inherits_session_metadata() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("claude-checkpoint-session");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let command = vec![repo_root.join("claude").display().to_string()];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        let session_id = "11111111-1111-4111-8111-111111111111".to_string();
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                "before-edit".to_string(),
+                super::CheckpointTriggerMetadata {
+                    tool_type: Some("edit".to_string()),
+                    command: Some("src/main.rs".to_string()),
+                    runtime_name: Some("claude".to_string()),
+                },
+            )
+            .expect("create checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(
+            checkpoint.claude_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(checkpoint.resumability, Resumability::Full);
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn claude_checkpoint_is_partial_without_session_metadata() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("claude-checkpoint-partial");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let command = vec![repo_root.join("claude").display().to_string()];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Partial);
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                "before-edit".to_string(),
+                super::CheckpointTriggerMetadata {
+                    tool_type: Some("edit".to_string()),
+                    command: Some("src/main.rs".to_string()),
+                    runtime_name: Some("claude".to_string()),
+                },
+            )
+            .expect("create checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(checkpoint.resumability, Resumability::Partial);
+        assert!(checkpoint.claude_session_id.is_none());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn resume_uses_claude_resume_path_instead_of_fresh_run() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("claude-resume");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("claude-resume-args.txt");
+        let command = vec![
+            create_fake_agent_script(&repo_root, "claude", &args_path),
+            "--print".to_string(),
+            "fresh prompt".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        let session_id = "11111111-1111-4111-8111-111111111111".to_string();
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                "before-edit".to_string(),
+                super::CheckpointTriggerMetadata {
+                    tool_type: Some("edit".to_string()),
+                    command: Some("src/main.rs".to_string()),
+                    runtime_name: Some("claude".to_string()),
+                },
+            )
+            .expect("create checkpoint");
+        fs::remove_file(&args_path).ok();
+        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        let args = fs::read_to_string(&args_path).expect("read agent args");
+        assert!(args.contains("--resume"));
+        assert!(args.contains(&session_id));
+        assert!(!args.contains("fresh prompt"));
+        assert!(!args.contains("--print"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn non_claude_resume_keeps_existing_behavior() {
+        let _guard = test_lock().lock().expect("lock tests");
+        let repo_root = create_temp_repo("codex-resume");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("codex-resume-args.txt");
+        let command = vec![
+            create_fake_agent_script(&repo_root, "codex", &args_path),
+            "--resume".to_string(),
+            "keep-me".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                "before-shell".to_string(),
+                super::CheckpointTriggerMetadata {
+                    tool_type: Some("bash".to_string()),
+                    command: Some("rm README.md".to_string()),
+                    runtime_name: Some("codex".to_string()),
+                },
+            )
+            .expect("create checkpoint");
+        fs::remove_file(&args_path).ok();
+        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        let args = fs::read_to_string(&args_path).expect("read agent args");
+        assert!(args.contains("--resume"));
+        assert!(args.contains("keep-me"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
     fn fork_clones_checkpoint_into_new_timeline() {
         let _guard = test_lock().lock().expect("lock tests");
         let repo_root = create_temp_repo("fork");
@@ -1318,11 +1680,19 @@ mod tests {
     }
 
     fn create_active_run(store: &DaedalusStore, runtime: &str) -> (String, String) {
+        create_active_run_with_command(store, vec![runtime.to_string()], Resumability::Full)
+    }
+
+    fn create_active_run_with_command(
+        store: &DaedalusStore,
+        command: Vec<String>,
+        resumability: Resumability,
+    ) -> (String, String) {
         let created_at = super::unix_timestamp();
         let run_id = "run_test".to_string();
         let timeline_id = "tl_test".to_string();
         store
-            .write_timeline(&crate::model::TimelineRecord {
+            .write_timeline(&TimelineRecord {
                 id: timeline_id.clone(),
                 name: Some("main".to_string()),
                 run_id: run_id.clone(),
@@ -1332,16 +1702,35 @@ mod tests {
             })
             .expect("write timeline");
         store
-            .write_run(&crate::model::RunRecord {
+            .write_run(&RunRecord {
                 id: run_id.clone(),
                 timeline_id: timeline_id.clone(),
-                command: vec![runtime.to_string()],
+                command,
                 created_at,
-                status: crate::model::RunStatus::Running,
+                status: RunStatus::Running,
                 last_checkpoint_id: None,
-                resumability: crate::model::Resumability::Full,
+                resumability,
             })
             .expect("write run");
         (run_id, timeline_id)
+    }
+
+    fn create_fake_agent_script(
+        repo_root: &std::path::Path,
+        name: &str,
+        output: &std::path::Path,
+    ) -> String {
+        let path = repo_root.join(name);
+        let mut file = fs::File::create(&path).expect("create script");
+        writeln!(
+            file,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+            output.display()
+        )
+        .expect("write script");
+        let mut permissions = fs::metadata(&path).expect("stat script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod script");
+        path.display().to_string()
     }
 }

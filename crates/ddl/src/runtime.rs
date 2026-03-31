@@ -51,6 +51,7 @@ pub struct ShellWrapperContext {
     pub run_id: String,
     pub timeline_id: String,
     pub runtime: SupportedRuntime,
+    pub claude_session_id: Option<String>,
 }
 
 pub fn apply_runtime_environment(
@@ -105,6 +106,7 @@ pub fn current_shell_context() -> Option<ShellWrapperContext> {
         run_id,
         timeline_id,
         runtime,
+        claude_session_id: None,
     })
 }
 
@@ -143,8 +145,23 @@ fn prepare_claude_command(
     );
 
     let mut prepared = vec![command[0].clone(), "--settings".to_string(), settings];
+    if let Some(session_id) = &context.claude_session_id {
+        if !command_requests_claude_session(command) {
+            prepared.push("--session-id".to_string());
+            prepared.push(session_id.clone());
+        }
+    }
     prepared.extend(command.iter().skip(1).cloned());
     Ok(prepared)
+}
+
+fn command_requests_claude_session(command: &[String]) -> bool {
+    command.iter().any(|item| {
+        matches!(
+            item.as_str(),
+            "--session-id" | "-r" | "--resume" | "-c" | "--continue"
+        )
+    })
 }
 
 fn create_shell_shim(
@@ -247,6 +264,7 @@ mod tests {
                 run_id: "run_test".to_string(),
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Claude,
+                claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
             },
         )
         .expect("prepare command");
@@ -255,8 +273,47 @@ mod tests {
         assert_eq!(prepared[1], "--settings");
         assert!(prepared[2].contains("Edit|MultiEdit|Write|Bash"));
         assert!(prepared[2].contains("claude-pre-tool-use"));
-        assert_eq!(prepared[3], "--print");
-        assert_eq!(prepared[4], "hello");
+        assert_eq!(prepared[3], "--session-id");
+        assert_eq!(prepared[4], "11111111-1111-4111-8111-111111111111");
+        assert_eq!(prepared[5], "--print");
+        assert_eq!(prepared[6], "hello");
+
+        std::fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn claude_resume_command_keeps_resume_flags_without_injecting_session_id() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "ddl-runtime-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
+
+        let command = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            "11111111-1111-4111-8111-111111111111".to_string(),
+        ];
+        let prepared = prepare_runtime_command(
+            &command,
+            &temp_dir,
+            &ShellWrapperContext {
+                run_id: "run_test".to_string(),
+                timeline_id: "tl_test".to_string(),
+                runtime: SupportedRuntime::Claude,
+                claude_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+            },
+        )
+        .expect("prepare command");
+
+        assert_eq!(prepared[0], "claude");
+        assert_eq!(prepared[1], "--settings");
+        assert_eq!(prepared[3], "--resume");
+        assert_eq!(prepared[4], "11111111-1111-4111-8111-111111111111");
+        assert!(!prepared.iter().any(|item| item == "--session-id"));
 
         std::fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
@@ -280,6 +337,7 @@ mod tests {
                 run_id: "run_test".to_string(),
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Codex,
+                claude_session_id: None,
             },
         )
         .expect("prepare command");
@@ -307,6 +365,7 @@ mod tests {
                 run_id: "run_test".to_string(),
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Claude,
+                claude_session_id: None,
             },
         )
         .expect_err("reject bare");

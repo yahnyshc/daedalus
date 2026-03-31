@@ -187,6 +187,8 @@ But MCP alone is not enough. The core value of `daedalus` is automatic protectio
 
 Full `resume` fidelity depends on `daedalus` owning or observing the run. If the agent was not run through `daedalus` or a supported integration, file restore may still work while resume is partial or unavailable.
 
+For Claude-backed runs owned by `daedalus`, v1 now pins a Claude session id at run start and persists it in `.daedalus/runtime/<run_id>/session.meta`. Claude checkpoints are only marked `full` when that session continuity is present.
+
 ## Demo Story
 
 The first demo should prove one thing clearly:
