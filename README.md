@@ -187,7 +187,15 @@ But MCP alone is not enough. The core value of `daedalus` is automatic protectio
 
 Full `resume` fidelity depends on `daedalus` owning or observing the run. If the agent was not run through `daedalus` or a supported integration, file restore may still work while resume is partial or unavailable.
 
-For Claude-backed runs owned by `daedalus`, v1 now pins a Claude session id at run start and persists it in `.daedalus/runtime/<run_id>/session.meta`. Claude checkpoints are only marked `full` when that session continuity is present.
+For Claude-backed runs owned by `daedalus`, v1 now pins a Claude session id at run start and persists it in `.daedalus/runtime/<run_id>/session.meta`. Checkpoints also capture an experimental best-effort snapshot of Claude's local project transcript and file-history under `.daedalus/runtime/<run_id>/claude-checkpoints/<checkpoint_id>/` when those files exist.
+
+Claude checkpoint resumability now means:
+
+- `full`: workspace restore exists and experimental Claude rewind state is available
+- `partial`: workspace restore exists and native `claude --resume <session_id>` is still available, but the experimental rewind snapshot is missing
+- `unavailable`: workspace restore cannot be performed
+
+On `ddl resume`, `daedalus` always restores the workspace first. Claude then either restores the experimental local rewind snapshot before `claude --resume <session_id>`, or falls back to native same-session resume with a warning if no rewind snapshot was captured.
 
 ## Demo Story
 
