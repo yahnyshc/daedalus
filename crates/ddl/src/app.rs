@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 use std::io::Read;
 
 use crate::error::{DdlError, Result};
+use crate::model::Resumability;
 use crate::store::DaedalusStore;
 
 pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
@@ -73,9 +74,9 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             println!("restored workspace to checkpoint {checkpoint}");
             Ok(0)
         }
-        CommandLine::Resume { checkpoint } => {
+        CommandLine::Rewind { checkpoint } => {
             let store = DaedalusStore::discover()?;
-            store.resume(&checkpoint)
+            store.rewind(&checkpoint)
         }
         CommandLine::Fork { checkpoint, name } => {
             let store = DaedalusStore::discover()?;
@@ -86,6 +87,7 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
     }
 }
 
+#[derive(Debug)]
 enum CommandLine {
     Help,
     Init,
@@ -104,7 +106,7 @@ enum CommandLine {
     Restore {
         checkpoint: String,
     },
-    Resume {
+    Rewind {
         checkpoint: String,
     },
     Fork {
@@ -133,9 +135,11 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         "diff" => parse_diff(parts),
         "restore" => parse_single_value(parts, "restore")
             .map(|checkpoint| CommandLine::Restore { checkpoint }),
-        "resume" => {
-            parse_single_value(parts, "resume").map(|checkpoint| CommandLine::Resume { checkpoint })
-        }
+        "rewind" => parse_single_value(parts, "rewind")
+            .map(|checkpoint| CommandLine::Rewind { checkpoint }),
+        "resume" => Err(DdlError::InvalidInput(
+            "`ddl resume` was removed; use `ddl rewind <checkpoint_id>` for agent-context rewind or `ddl restore <checkpoint_id>` for repo-only recovery".to_string(),
+        )),
         "fork" => {
             if parts.len() < 3 {
                 return Err(DdlError::InvalidInput(
@@ -279,23 +283,26 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
                 .as_deref()
                 .map(|command| format!(" ({command})"))
                 .unwrap_or_default();
-            let claude_resume = match (
+            let _ = writeln!(
+                output,
+                "  checkpoint {} {}{}",
+                checkpoint.id, checkpoint.reason, trigger
+            );
+            let restore_status = match checkpoint.resumability {
+                Resumability::Unavailable => "Restore: unavailable",
+                _ => "Restore: available",
+            };
+            let rewind_status = match (
                 checkpoint.runtime_name.as_deref(),
                 checkpoint.resumability.as_str(),
             ) {
-                (Some("claude"), "full") => " [Claude resume: available]",
-                (Some("claude"), "partial") => " [Claude resume: missing]",
-                (Some("claude"), "unavailable") => " [Claude resume: unavailable]",
-                _ => "",
+                (_, "unavailable") => "Rewind: unavailable",
+                (Some("claude"), "full") => "Rewind: available",
+                (Some("claude"), "partial") => "Rewind: unavailable (restore only)",
+                _ => "Rewind: available",
             };
-            let _ = writeln!(
-                output,
-                "  checkpoint {} [{}] {}{}",
-                checkpoint.id, checkpoint.resumability, checkpoint.reason, trigger
-            );
-            if !claude_resume.is_empty() {
-                let _ = writeln!(output, "    {}", claude_resume.trim());
-            }
+            let _ = writeln!(output, "    {restore_status}");
+            let _ = writeln!(output, "    {rewind_status}");
         }
     }
 
@@ -314,7 +321,7 @@ Usage:
   ddl log
   ddl diff [checkpoint_a] [checkpoint_b]
   ddl restore <checkpoint_id>
-  ddl resume <checkpoint_id>
+  ddl rewind <checkpoint_id>
   ddl fork <checkpoint_id> [name]
 "
     );
@@ -322,6 +329,7 @@ Usage:
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
@@ -331,10 +339,10 @@ mod tests {
     };
     use crate::store::DaedalusStore;
 
-    use super::render_log;
+    use super::{CommandLine, parse_arguments, render_log};
 
     #[test]
-    fn log_surfaces_claude_resume_availability() {
+    fn log_surfaces_claude_rewind_availability() {
         let repo_root = create_temp_repo("app-log");
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
@@ -363,6 +371,9 @@ mod tests {
         .expect("write run");
         let snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_test");
         fs::create_dir_all(&snapshot_path).expect("create snapshot");
+        let rewind_path = repo_root.join(".daedalus/runtime/run_test/claude-checkpoints/cp_full");
+        fs::create_dir_all(&rewind_path).expect("create rewind snapshot");
+        fs::write(rewind_path.join("marker.txt"), "saved").expect("write rewind marker");
         CheckpointRecord {
             id: "cp_test".to_string(),
             timeline_id: "tl_test".to_string(),
@@ -377,6 +388,7 @@ mod tests {
             trigger_command: Some("src/main.rs".to_string()),
             runtime_name: Some("claude".to_string()),
             claude_session_id: None,
+            claude_rewind_rel_path: None,
             fingerprint: RuntimeFingerprint {
                 cwd: repo_root.display().to_string(),
                 repo_root: repo_root.display().to_string(),
@@ -388,12 +400,67 @@ mod tests {
         }
         .write(&repo_root.join(".daedalus/checkpoints/cp_test.meta"))
         .expect("write checkpoint");
+        CheckpointRecord {
+            id: "cp_full".to_string(),
+            timeline_id: "tl_test".to_string(),
+            run_id: "run_test".to_string(),
+            parent_checkpoint_id: Some("cp_test".to_string()),
+            reason: "before-shell".to_string(),
+            snapshot_rel_path: "snapshots/cp_test".to_string(),
+            shadow_commit: "cafebabe".to_string(),
+            created_at: created_at + 1,
+            resumability: Resumability::Full,
+            trigger_tool_type: Some("bash".to_string()),
+            trigger_command: Some("rm README.md".to_string()),
+            runtime_name: Some("claude".to_string()),
+            claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
+            claude_rewind_rel_path: Some("runtime/run_test/claude-checkpoints/cp_full".to_string()),
+            fingerprint: RuntimeFingerprint {
+                cwd: repo_root.display().to_string(),
+                repo_root: repo_root.display().to_string(),
+                git_head: "cafebabe".to_string(),
+                git_branch: "main".to_string(),
+                git_dirty: false,
+                git_version: "git version".to_string(),
+            },
+        }
+        .write(&repo_root.join(".daedalus/checkpoints/cp_full.meta"))
+        .expect("write full checkpoint");
 
         let output = render_log(&store).expect("render log");
-        assert!(output.contains("checkpoint cp_test [partial] before-edit (src/main.rs)"));
-        assert!(output.contains("Claude resume: missing"));
+        assert!(output.contains("checkpoint cp_test before-edit (src/main.rs)"));
+        assert!(output.contains("Restore: available"));
+        assert!(output.contains("Rewind: unavailable (restore only)"));
+        assert!(output.contains("checkpoint cp_full before-shell (rm README.md)"));
+        assert!(output.contains("Rewind: available"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn parse_arguments_accepts_rewind_and_rejects_resume() {
+        match parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("rewind"),
+            OsString::from("cp_test"),
+        ])
+        .expect("parse rewind")
+        {
+            CommandLine::Rewind { checkpoint } => assert_eq!(checkpoint, "cp_test"),
+            _ => panic!("expected rewind command"),
+        }
+
+        let error = parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("resume"),
+            OsString::from("cp_test"),
+        ])
+        .expect_err("resume should be removed");
+        assert!(
+            error
+                .to_string()
+                .contains("`ddl resume` was removed; use `ddl rewind <checkpoint_id>`")
+        );
     }
 
     fn create_temp_repo(name: &str) -> PathBuf {

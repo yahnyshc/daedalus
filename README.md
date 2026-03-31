@@ -4,7 +4,7 @@
 
 It is built for the moment right before an agent does something unsafe, and for the moment right after you realize it was a mistake.
 
-The goal is simple: restore the exact repo/workspace state and the agent context immediately before a risky action, then either continue the same timeline or fork a new one.
+The goal is simple: restore the exact repo/workspace state and, when available, rewind the agent context immediately before a risky action, then either continue the same timeline or fork a new one.
 
 ## The Problem
 
@@ -36,7 +36,7 @@ It runs a supported agent under protection, saves checkpoints before configured 
 
 The key promise is:
 
-> Restore the exact repo/workspace state and the agent context immediately before a risky action, then resume or fork from there.
+> Restore the exact repo/workspace state and the agent context immediately before a risky action, then rewind or fork from there.
 
 ## Core Workflow
 
@@ -48,7 +48,7 @@ The public workflow is:
 4. the action goes bad
 5. `ddl restore <checkpoint_id>`
 6. workspace returns to the pre-action state
-7. `ddl resume <checkpoint_id>` or `ddl fork <checkpoint_id> [name]`
+7. `ddl rewind <checkpoint_id>` or `ddl fork <checkpoint_id> [name]`
 8. the agent continues from the saved context
 
 This is why v1 is CLI-first. `daedalus` needs to own or observe the run in order to protect it properly.
@@ -92,7 +92,7 @@ ddl shell -- <command>
 ddl log
 ddl diff [checkpoint_a] [checkpoint_b]
 ddl restore <checkpoint_id>
-ddl resume <checkpoint_id>
+ddl rewind <checkpoint_id>
 ddl fork <checkpoint_id> [name]
 ```
 
@@ -103,8 +103,8 @@ Command intent:
 - `ddl shell`: execute a shell command through `daedalus`' checkpoint matcher
 - `ddl log`: inspect execution timelines and checkpoints
 - `ddl diff`: inspect file and metadata differences between checkpoints
-- `ddl restore`: return workspace and checkpoint metadata to a known point
-- `ddl resume`: continue the same timeline from a checkpoint using saved agent context
+- `ddl restore`: return workspace and checkpoint metadata to a known point without launching the agent
+- `ddl rewind`: restore workspace and, when available, continue the same timeline from a checkpoint with saved agent context
 - `ddl fork`: create a new execution timeline from a checkpoint without mutating the original one
 
 Manual checkpoint commands are deliberately not in the first public story. The core value is automatic protection, not asking users to remember another save button.
@@ -144,7 +144,7 @@ Older repos that only have the legacy `.daedalus/config` file must be re-initial
 
 - `checkpoint`: a saved execution point before an unsafe action
 - `restore`: return workspace and checkpoint metadata to that point
-- `resume`: continue the same execution timeline from that checkpoint
+- `rewind`: continue the same execution timeline from that checkpoint when agent context can be restored
 - `fork`: create a new execution timeline from that checkpoint
 - `timeline`: the ordered history of checkpoints for one protected run
 
@@ -161,7 +161,7 @@ The user model should stay simple:
 - protected runs
 - checkpoints
 - restore
-- resume
+- rewind
 - forks
 - timelines
 
@@ -181,13 +181,20 @@ Tertiary:
 
 - agent-specific hooks where supported for automatic checkpointing around tool execution
 
-MCP matters because it lets agents call `restore`, `resume`, `fork`, `diff`, and `log` as first-class tools.
+MCP matters because it lets agents call `restore`, `rewind`, `fork`, `diff`, and `log` as first-class tools.
 
 But MCP alone is not enough. The core value of `daedalus` is automatic protection before a risky action, which usually requires a wrapper or a hook surface.
 
-Full `resume` fidelity depends on `daedalus` owning or observing the run. If the agent was not run through `daedalus` or a supported integration, file restore may still work while resume is partial or unavailable.
+Full `rewind` fidelity depends on `daedalus` owning or observing the run. If the agent was not run through `daedalus` or a supported integration, file restore may still work while rewind is unavailable.
 
-For Claude-backed runs owned by `daedalus`, v1 now pins a Claude session id at run start and persists it in `.daedalus/runtime/<run_id>/session.meta`. Claude checkpoints are only marked `full` when that session continuity is present.
+For Claude-backed runs owned by `daedalus`, v1 now pins a Claude session id at run start and persists it in `.daedalus/runtime/<run_id>/session.meta`. Checkpoints also capture an experimental best-effort snapshot of Claude's local project transcript and file-history under `.daedalus/runtime/<run_id>/claude-checkpoints/<checkpoint_id>/` when those files exist.
+
+For users, the decision is simpler:
+
+- `ddl restore`: repo/workspace only
+- `ddl rewind`: repo/workspace plus agent-context rewind when that checkpoint can actually provide it
+
+For Claude-backed runs owned by `daedalus`, rewind is only considered available when the workspace snapshot exists and the experimental Claude local rewind snapshot exists. If that context is unavailable, `ddl rewind` fails clearly and the user should choose `ddl restore` instead.
 
 ## Demo Story
 
@@ -212,7 +219,7 @@ Then:
 
 ```bash
 ddl restore cp_42
-ddl resume cp_42
+ddl rewind cp_42
 ```
 
 Or, if the user wants an alternate path:
@@ -256,7 +263,7 @@ This repo now includes a working shell-first v1 implementation. It keeps the rep
 
 The implementation should stay anchored to the same promise:
 
-protect agent runs, checkpoint before risky actions, restore cleanly, then resume or fork from the exact decision point.
+protect agent runs, checkpoint before risky actions, restore cleanly, then rewind or fork from the exact decision point.
 
 ## Current Base
 

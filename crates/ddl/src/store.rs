@@ -22,6 +22,9 @@ const STATE_DIR: &str = ".daedalus";
 const SNAPSHOT_DIR_NAME: &str = "snapshots";
 const LEGACY_CONFIG_FILE_NAME: &str = "config";
 const PRESERVED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
+const CLAUDE_DIR_NAME: &str = ".claude";
+const CLAUDE_PROJECTS_DIR_NAME: &str = "projects";
+const CLAUDE_FILE_HISTORY_DIR_NAME: &str = "file-history";
 
 #[derive(Clone, Debug)]
 pub struct DaedalusStore {
@@ -55,6 +58,22 @@ struct CheckpointTriggerMetadata {
 struct StandaloneShellRun {
     timeline_id: String,
     run_id: String,
+}
+
+#[derive(Clone, Debug)]
+enum ClaudeLocalRestoreOutcome {
+    Restored,
+    NativeFallback { reason: String },
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeRestoreOperation {
+    target: PathBuf,
+    staged: PathBuf,
+    backup: PathBuf,
+    source_path: PathBuf,
+    had_original: bool,
+    applied: bool,
 }
 
 impl DaedalusStore {
@@ -283,12 +302,19 @@ impl DaedalusStore {
         Ok(0)
     }
 
-    pub fn resume(&self, checkpoint_id: &str) -> Result<i32> {
+    pub fn rewind(&self, checkpoint_id: &str) -> Result<i32> {
         self.ensure_initialized()?;
         let checkpoint = self.read_checkpoint(checkpoint_id)?;
-        if checkpoint.resumability != Resumability::Full {
+        if checkpoint.resumability == Resumability::Unavailable {
             return Err(DdlError::InvalidInput(format!(
-                "checkpoint `{checkpoint_id}` cannot be resumed"
+                "checkpoint `{checkpoint_id}` cannot be rewound: workspace restore is unavailable"
+            )));
+        }
+        if checkpoint.runtime_name.as_deref() == Some("claude")
+            && checkpoint.resumability != Resumability::Full
+        {
+            return Err(DdlError::InvalidInput(format!(
+                "checkpoint `{checkpoint_id}` cannot be rewound: agent context is unavailable; use `ddl restore {checkpoint_id}` for repo-only recovery"
             )));
         }
 
@@ -300,24 +326,36 @@ impl DaedalusStore {
         self.write_run(&run)?;
 
         let runtime = SupportedRuntime::detect(&run.command).ok();
-        let mut resume_command = run.command.clone();
+        let mut rewind_command = run.command.clone();
         if runtime.is_some() {
             self.load_config()?;
         }
-        let shell_context = runtime.map(|runtime| {
+        let shell_context = runtime
+            .map(|runtime| {
             if runtime == SupportedRuntime::Claude {
-                resume_command = self.claude_resume_command(&run.command, &checkpoint);
+                match self.restore_claude_local_state(&checkpoint) {
+                    Ok(ClaudeLocalRestoreOutcome::Restored) => {}
+                    Ok(ClaudeLocalRestoreOutcome::NativeFallback { reason }) => {
+                        return Err(DdlError::InvalidInput(format!(
+                            "checkpoint `{}` cannot be rewound: {reason}; use `ddl restore {}` for repo-only recovery",
+                            checkpoint.id, checkpoint.id
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                }
+                rewind_command = self.claude_resume_command(&run.command, &checkpoint);
             }
 
-            ShellWrapperContext {
+            Ok(ShellWrapperContext {
                 run_id: run.id.clone(),
                 timeline_id: checkpoint.timeline_id.clone(),
                 runtime,
                 claude_session_id: None,
-            }
-        });
+            })
+        })
+            .transpose()?;
 
-        let status = self.execute_owned_command(&resume_command, shell_context.as_ref())?;
+        let status = self.execute_owned_command(&rewind_command, shell_context.as_ref())?;
         run.status = if status.success() {
             RunStatus::Succeeded
         } else {
@@ -687,6 +725,14 @@ impl DaedalusStore {
                 .filter(|value| Self::is_valid_claude_session_id(value)),
             _ => None,
         };
+        let claude_rewind_rel_path = match runtime {
+            Some(SupportedRuntime::Claude) => self.snapshot_claude_local_state(
+                run_id,
+                &checkpoint_id,
+                claude_session_id.as_deref(),
+            )?,
+            _ => None,
+        };
 
         run_command(
             Command::new("git")
@@ -734,11 +780,13 @@ impl DaedalusStore {
                 &snapshot_path,
                 runtime_name.as_deref(),
                 claude_session_id.as_deref(),
+                claude_rewind_rel_path.as_deref(),
             ),
             trigger_tool_type: trigger.tool_type,
             trigger_command: trigger.command,
             runtime_name,
             claude_session_id,
+            claude_rewind_rel_path,
             fingerprint: self.capture_fingerprint()?,
         };
         self.write_checkpoint(&checkpoint)?;
@@ -759,6 +807,11 @@ impl DaedalusStore {
         fs::create_dir_all(&new_snapshot)?;
         let source_snapshot = self.snapshot_path(&source.snapshot_rel_path);
         copy_dir_contents(&source_snapshot, &new_snapshot)?;
+        let claude_rewind_rel_path = self.clone_claude_local_state(
+            source.claude_rewind_rel_path.as_deref(),
+            run_id,
+            &checkpoint_id,
+        )?;
 
         run_command(
             Command::new("git")
@@ -806,11 +859,13 @@ impl DaedalusStore {
                 &new_snapshot,
                 source.runtime_name.as_deref(),
                 source.claude_session_id.as_deref(),
+                claude_rewind_rel_path.as_deref(),
             ),
             trigger_tool_type: None,
             trigger_command: None,
             runtime_name: source.runtime_name.clone(),
             claude_session_id: source.claude_session_id.clone(),
+            claude_rewind_rel_path,
             fingerprint: source.fingerprint.clone(),
         };
         self.write_checkpoint(&checkpoint)?;
@@ -868,6 +923,323 @@ impl DaedalusStore {
             .join("session.meta")
     }
 
+    fn claude_checkpoint_state_path(&self, run_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.state_dir
+            .join("runtime")
+            .join(run_id)
+            .join("claude-checkpoints")
+            .join(checkpoint_id)
+    }
+
+    fn claude_project_key(repo_root: &Path) -> String {
+        repo_root.display().to_string().replace('/', "-")
+    }
+
+    fn claude_home_dir() -> Option<PathBuf> {
+        env::var_os("HOME").map(PathBuf::from)
+    }
+
+    fn claude_projects_root(&self, home_dir: &Path) -> PathBuf {
+        home_dir
+            .join(CLAUDE_DIR_NAME)
+            .join(CLAUDE_PROJECTS_DIR_NAME)
+    }
+
+    fn claude_file_history_root(&self, home_dir: &Path) -> PathBuf {
+        home_dir
+            .join(CLAUDE_DIR_NAME)
+            .join(CLAUDE_FILE_HISTORY_DIR_NAME)
+    }
+
+    fn claude_transcript_path(&self, home_dir: &Path, session_id: &str) -> PathBuf {
+        self.claude_projects_root(home_dir)
+            .join(Self::claude_project_key(&self.repo_root))
+            .join(format!("{session_id}.jsonl"))
+    }
+
+    fn claude_file_history_path(&self, home_dir: &Path, session_id: &str) -> PathBuf {
+        self.claude_file_history_root(home_dir).join(session_id)
+    }
+
+    fn claude_rewind_snapshot_exists(&self, relative: &str) -> bool {
+        path_has_entries(&self.state_dir.join(relative))
+    }
+
+    fn snapshot_claude_local_state(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Some(session_id) = session_id.filter(|value| Self::is_valid_claude_session_id(value))
+        else {
+            return Ok(None);
+        };
+        let Some(home_dir) = Self::claude_home_dir() else {
+            return Ok(None);
+        };
+
+        let snapshot_path = self.claude_checkpoint_state_path(run_id, checkpoint_id);
+        if snapshot_path.exists() {
+            fs::remove_dir_all(&snapshot_path)?;
+        }
+        fs::create_dir_all(&snapshot_path)?;
+
+        let transcript_source = self.claude_transcript_path(&home_dir, session_id);
+        let transcript_destination = snapshot_path
+            .join(CLAUDE_PROJECTS_DIR_NAME)
+            .join(Self::claude_project_key(&self.repo_root))
+            .join(format!("{session_id}.jsonl"));
+        let mut captured_any = false;
+        if transcript_source.exists() {
+            copy_path(&transcript_source, &transcript_destination)?;
+            captured_any = true;
+        }
+
+        let file_history_source = self.claude_file_history_path(&home_dir, session_id);
+        let file_history_destination = snapshot_path
+            .join(CLAUDE_FILE_HISTORY_DIR_NAME)
+            .join(session_id);
+        if file_history_source.exists() {
+            copy_path(&file_history_source, &file_history_destination)?;
+            captured_any = true;
+        }
+
+        if captured_any {
+            Ok(Some(
+                self.claude_checkpoint_state_path(run_id, checkpoint_id)
+                    .strip_prefix(&self.state_dir)
+                    .unwrap_or(&snapshot_path)
+                    .display()
+                    .to_string(),
+            ))
+        } else {
+            fs::remove_dir_all(&snapshot_path)?;
+            Ok(None)
+        }
+    }
+
+    fn clone_claude_local_state(
+        &self,
+        source_relative: Option<&str>,
+        run_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<String>> {
+        let Some(source_relative) = source_relative else {
+            return Ok(None);
+        };
+        let source_path = self.state_dir.join(source_relative);
+        if !source_path.exists() {
+            return Ok(None);
+        }
+
+        let destination = self.claude_checkpoint_state_path(run_id, checkpoint_id);
+        if destination.exists() {
+            fs::remove_dir_all(&destination)?;
+        }
+        fs::create_dir_all(&destination)?;
+        copy_dir_contents(&source_path, &destination)?;
+
+        Ok(Some(
+            destination
+                .strip_prefix(&self.state_dir)
+                .unwrap_or(&destination)
+                .display()
+                .to_string(),
+        ))
+    }
+
+    fn restore_claude_local_state(
+        &self,
+        checkpoint: &CheckpointRecord,
+    ) -> Result<ClaudeLocalRestoreOutcome> {
+        let Some(session_id) = checkpoint
+            .claude_session_id
+            .as_deref()
+            .filter(|value| Self::is_valid_claude_session_id(value))
+        else {
+            return Err(DdlError::InvalidInput(format!(
+                "checkpoint `{}` cannot be rewound: missing Claude session id",
+                checkpoint.id
+            )));
+        };
+
+        if checkpoint.runtime_name.as_deref() != Some("claude") {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: "checkpoint is not Claude-backed".to_string(),
+            });
+        }
+
+        let Some(relative) = checkpoint.claude_rewind_rel_path.as_deref() else {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: "checkpoint has no saved experimental Claude rewind snapshot".to_string(),
+            });
+        };
+        let snapshot_path = self.state_dir.join(relative);
+        if !snapshot_path.exists() {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: "checkpoint Claude rewind snapshot is missing".to_string(),
+            });
+        }
+
+        let Some(home_dir) = Self::claude_home_dir() else {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: "HOME is unavailable, so Claude local state cannot be restored".to_string(),
+            });
+        };
+
+        let mut operations = Vec::new();
+        let transcript_source = snapshot_path
+            .join(CLAUDE_PROJECTS_DIR_NAME)
+            .join(Self::claude_project_key(&self.repo_root))
+            .join(format!("{session_id}.jsonl"));
+        if transcript_source.exists() {
+            operations.push(Self::build_claude_restore_operation(
+                self.claude_transcript_path(&home_dir, session_id),
+                &transcript_source,
+            )?);
+        }
+
+        let file_history_source = snapshot_path
+            .join(CLAUDE_FILE_HISTORY_DIR_NAME)
+            .join(session_id);
+        if file_history_source.exists() {
+            operations.push(Self::build_claude_restore_operation(
+                self.claude_file_history_path(&home_dir, session_id),
+                &file_history_source,
+            )?);
+        }
+
+        if operations.is_empty() {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: "checkpoint Claude rewind snapshot is empty".to_string(),
+            });
+        }
+
+        if let Err(error) = Self::stage_claude_restore_operations(&mut operations) {
+            return Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                reason: format!("failed to stage Claude rewind state: {error}"),
+            });
+        }
+
+        match Self::apply_claude_restore_operations(&mut operations) {
+            Ok(()) => Ok(ClaudeLocalRestoreOutcome::Restored),
+            Err(error) => {
+                if let Some(reason) = Self::rollback_claude_restore_operations(&mut operations)? {
+                    Ok(ClaudeLocalRestoreOutcome::NativeFallback {
+                        reason: format!("{error}; {reason}"),
+                    })
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn build_claude_restore_operation(
+        target: PathBuf,
+        source_path: &Path,
+    ) -> Result<ClaudeRestoreOperation> {
+        let token = Uuid::new_v4().to_string();
+        Ok(ClaudeRestoreOperation {
+            target: target.clone(),
+            staged: target.with_file_name(format!(
+                ".{}.ddl-stage-{token}",
+                target
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("claude-state")
+            )),
+            backup: target.with_file_name(format!(
+                ".{}.ddl-backup-{token}",
+                target
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("claude-state")
+            )),
+            source_path: source_path.to_path_buf(),
+            had_original: target.exists(),
+            applied: false,
+        })
+    }
+
+    fn stage_claude_restore_operations(operations: &mut [ClaudeRestoreOperation]) -> Result<()> {
+        for operation in operations {
+            if let Some(parent) = operation.staged.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if operation.staged.exists() {
+                remove_path(&operation.staged)?;
+            }
+            if operation.backup.exists() {
+                remove_path(&operation.backup)?;
+            }
+            copy_path(&operation.source_path, &operation.staged)?;
+        }
+        Ok(())
+    }
+
+    fn apply_claude_restore_operations(operations: &mut [ClaudeRestoreOperation]) -> Result<()> {
+        for operation in operations.iter_mut() {
+            if let Some(parent) = operation.target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if operation.had_original {
+                fs::rename(&operation.target, &operation.backup)?;
+            }
+            if let Err(error) = fs::rename(&operation.staged, &operation.target) {
+                if operation.had_original && operation.backup.exists() {
+                    let _ = fs::rename(&operation.backup, &operation.target);
+                }
+                return Err(error.into());
+            }
+            operation.applied = true;
+        }
+        for operation in operations.iter() {
+            if operation.had_original && operation.backup.exists() {
+                remove_path(&operation.backup)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_claude_restore_operations(
+        operations: &mut [ClaudeRestoreOperation],
+    ) -> Result<Option<String>> {
+        let mut rollback_failed = None;
+        for operation in operations.iter_mut().rev() {
+            if operation.applied {
+                if operation.target.exists() {
+                    remove_path(&operation.target)?;
+                }
+                if operation.had_original && operation.backup.exists() {
+                    if let Err(error) = fs::rename(&operation.backup, &operation.target) {
+                        rollback_failed = Some(format!(
+                            "rollback failed while restoring {}: {error}",
+                            operation.target.display()
+                        ));
+                    }
+                }
+                operation.applied = false;
+            }
+
+            if operation.staged.exists() {
+                remove_path(&operation.staged)?;
+            }
+            if operation.backup.exists() {
+                remove_path(&operation.backup)?;
+            }
+        }
+
+        if let Some(reason) = rollback_failed {
+            return Err(DdlError::InvalidState(reason));
+        }
+
+        Ok(Some(
+            "live Claude files were rolled back cleanly before rewind aborted".to_string(),
+        ))
+    }
+
     fn runtime_for_run(&self, run_id: &str) -> Option<SupportedRuntime> {
         self.read_run(run_id)
             .ok()
@@ -880,6 +1252,7 @@ impl DaedalusStore {
             &snapshot_path,
             checkpoint.runtime_name.as_deref(),
             checkpoint.claude_session_id.as_deref(),
+            checkpoint.claude_rewind_rel_path.as_deref(),
         );
         checkpoint
     }
@@ -889,15 +1262,22 @@ impl DaedalusStore {
         snapshot_path: &Path,
         runtime_name: Option<&str>,
         claude_session_id: Option<&str>,
+        claude_rewind_rel_path: Option<&str>,
     ) -> Resumability {
         if !snapshot_path.exists() {
             return Resumability::Unavailable;
         }
 
-        if runtime_name == Some("claude")
-            && !claude_session_id.is_some_and(Self::is_valid_claude_session_id)
-        {
-            return Resumability::Partial;
+        if runtime_name == Some("claude") {
+            if !claude_session_id.is_some_and(Self::is_valid_claude_session_id) {
+                return Resumability::Partial;
+            }
+
+            if !claude_rewind_rel_path
+                .is_some_and(|relative| self.claude_rewind_snapshot_exists(relative))
+            {
+                return Resumability::Partial;
+            }
         }
 
         Resumability::Full
@@ -1010,6 +1390,35 @@ fn copy_path(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn remove_path(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn path_has_entries(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+
+    if path.is_file() {
+        return true;
+    }
+
+    fs::read_dir(path)
+        .ok()
+        .and_then(|mut entries| entries.next())
+        .is_some()
+}
+
 fn run_command(command: &mut Command, label: &str) -> Result<()> {
     let output = command.output()?;
     if output.status.success() {
@@ -1061,7 +1470,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::{Mutex, OnceLock};
 
@@ -1074,6 +1483,12 @@ mod tests {
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_tests() -> std::sync::MutexGuard<'static, ()> {
+        test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     #[test]
@@ -1097,7 +1512,7 @@ mod tests {
 
     #[test]
     fn shell_command_creates_checkpoint_before_matching_mutation() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("shell-match");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1133,7 +1548,7 @@ mod tests {
 
     #[test]
     fn shell_command_skips_non_matching_commands() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("shell-skip");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1161,7 +1576,7 @@ mod tests {
 
     #[test]
     fn shell_command_uses_existing_runtime_context() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("shell-runtime");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1200,7 +1615,7 @@ mod tests {
 
     #[test]
     fn claude_edit_hook_records_checkpoint_on_active_timeline() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-edit-hook");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1245,7 +1660,7 @@ mod tests {
 
     #[test]
     fn claude_bash_hook_records_before_shell_checkpoint_on_active_timeline() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-bash-hook");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1290,7 +1705,7 @@ mod tests {
 
     #[test]
     fn claude_multiedit_hook_records_checkpoint_when_rule_matches() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-multiedit-hook");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1337,7 +1752,7 @@ mod tests {
 
     #[test]
     fn claude_bash_restart_hook_skips_checkpointing() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-bash-restart");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1376,7 +1791,7 @@ mod tests {
 
     #[test]
     fn claude_hook_skips_non_matching_tools() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-hook-skip");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1417,7 +1832,7 @@ mod tests {
 
     #[test]
     fn claude_run_persists_session_metadata_and_injects_session_id() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-run-session");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1451,9 +1866,10 @@ mod tests {
     }
 
     #[test]
-    fn claude_checkpoint_inherits_session_metadata() {
-        let _guard = test_lock().lock().expect("lock tests");
+    fn claude_checkpoint_captures_local_rewind_snapshot_when_transcript_exists() {
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-checkpoint-session");
+        let home_dir = create_temp_home("claude-checkpoint-session");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
@@ -1470,8 +1886,16 @@ mod tests {
                 },
             )
             .expect("write runtime metadata");
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"before tool\"}\n",
+            &[("history.txt", "saved change\n")],
+        );
 
         let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
         std::env::set_current_dir(&repo_root).expect("cd temp repo");
         let checkpoint = store
             .create_checkpoint_internal(
@@ -1487,28 +1911,70 @@ mod tests {
             )
             .expect("create checkpoint");
         std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
 
         assert_eq!(
             checkpoint.claude_session_id.as_deref(),
             Some(session_id.as_str())
         );
         assert_eq!(checkpoint.resumability, Resumability::Full);
+        let rewind_path = repo_root.join(".daedalus").join(
+            checkpoint
+                .claude_rewind_rel_path
+                .as_deref()
+                .expect("claude rewind snapshot"),
+        );
+        assert!(rewind_path.exists());
+        assert_eq!(checkpoint.resumability, Resumability::Full);
+        assert_eq!(
+            fs::read_to_string(
+                rewind_path
+                    .join("projects")
+                    .join(super::DaedalusStore::claude_project_key(store.repo_root()))
+                    .join(format!("{session_id}.jsonl"))
+            )
+            .expect("read saved transcript"),
+            "{\"type\":\"assistant\",\"text\":\"before tool\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                rewind_path
+                    .join("file-history")
+                    .join(&session_id)
+                    .join("history.txt")
+            )
+            .expect("read saved file history"),
+            "saved change\n"
+        );
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
     #[test]
-    fn claude_checkpoint_is_partial_without_session_metadata() {
-        let _guard = test_lock().lock().expect("lock tests");
+    fn claude_checkpoint_is_partial_when_rewind_snapshot_is_missing() {
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-checkpoint-partial");
+        let home_dir = create_temp_home("claude-checkpoint-partial");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
         let command = vec![repo_root.join("claude").display().to_string()];
         let (run_id, timeline_id) =
-            create_active_run_with_command(&store, command, Resumability::Partial);
+            create_active_run_with_command(&store, command, Resumability::Full);
+        let session_id = "22222222-2222-4222-8222-222222222222".to_string();
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
 
         let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
         std::env::set_current_dir(&repo_root).expect("cd temp repo");
         let checkpoint = store
             .create_checkpoint_internal(
@@ -1524,17 +1990,128 @@ mod tests {
             )
             .expect("create checkpoint");
         std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
 
         assert_eq!(checkpoint.resumability, Resumability::Partial);
-        assert!(checkpoint.claude_session_id.is_none());
+        assert_eq!(
+            checkpoint.claude_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+        assert!(checkpoint.claude_rewind_rel_path.is_none());
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
     #[test]
-    fn resume_uses_claude_resume_path_instead_of_fresh_run() {
-        let _guard = test_lock().lock().expect("lock tests");
+    fn claude_rewind_restores_saved_local_state_before_launch_and_replaces_targets() {
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("claude-resume");
+        let home_dir = create_temp_home("claude-resume");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("claude-resume-args.txt");
+        let transcript_seen_path = repo_root.join("claude-transcript-seen.txt");
+        let history_seen_path = repo_root.join("claude-history-seen.txt");
+        let session_id = "11111111-1111-4111-8111-111111111111".to_string();
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"rewound\"}\n",
+            &[("saved.txt", "checkpoint history\n")],
+        );
+        let command = vec![
+            create_fake_claude_resume_script(
+                &repo_root,
+                "claude",
+                &args_path,
+                &transcript_seen_path,
+                &history_seen_path,
+                &home_dir,
+                store.repo_root(),
+                &session_id,
+            ),
+            "--print".to_string(),
+            "fresh prompt".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                "before-edit".to_string(),
+                super::CheckpointTriggerMetadata {
+                    tool_type: Some("edit".to_string()),
+                    command: Some("src/main.rs".to_string()),
+                    runtime_name: Some("claude".to_string()),
+                },
+            )
+            .expect("create checkpoint");
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"latest\"}\n",
+            &[
+                ("saved.txt", "latest history\n"),
+                ("extra.txt", "should disappear\n"),
+            ],
+        );
+        fs::remove_file(&args_path).ok();
+        let exit_code = store.rewind(&checkpoint.id).expect("rewind checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
+
+        assert_eq!(exit_code, 0);
+        let args = fs::read_to_string(&args_path).expect("read agent args");
+        assert!(args.contains("--resume"));
+        assert!(args.contains(&session_id));
+        assert!(!args.contains("fresh prompt"));
+        assert!(!args.contains("--print"));
+        assert_eq!(
+            fs::read_to_string(&transcript_seen_path).expect("read seen transcript"),
+            "{\"type\":\"assistant\",\"text\":\"rewound\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&history_seen_path).expect("read seen history"),
+            "saved.txt\n"
+        );
+        let transcript_path =
+            claude_transcript_path_for_test(&home_dir, store.repo_root(), &session_id);
+        assert_eq!(
+            fs::read_to_string(&transcript_path).expect("read live transcript"),
+            "{\"type\":\"assistant\",\"text\":\"rewound\"}\n"
+        );
+        let file_history_dir = claude_file_history_path_for_test(&home_dir, &session_id);
+        assert!(file_history_dir.join("saved.txt").exists());
+        assert!(!file_history_dir.join("extra.txt").exists());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
+    }
+
+    #[test]
+    fn claude_rewind_fails_when_agent_context_is_unavailable() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("claude-resume-partial");
+        let home_dir = create_temp_home("claude-resume-partial");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
@@ -1546,7 +2123,7 @@ mod tests {
         ];
         let (run_id, timeline_id) =
             create_active_run_with_command(&store, command, Resumability::Full);
-        let session_id = "11111111-1111-4111-8111-111111111111".to_string();
+        let session_id = "33333333-3333-4333-8333-333333333333".to_string();
         store
             .write_runtime_metadata(
                 &run_id,
@@ -1558,6 +2135,7 @@ mod tests {
             .expect("write runtime metadata");
 
         let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
         std::env::set_current_dir(&repo_root).expect("cd temp repo");
         let checkpoint = store
             .create_checkpoint_internal(
@@ -1573,22 +2151,27 @@ mod tests {
             )
             .expect("create checkpoint");
         fs::remove_file(&args_path).ok();
-        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        let error = store
+            .rewind(&checkpoint.id)
+            .expect_err("rewind should fail without agent context");
         std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
 
-        assert_eq!(exit_code, 0);
-        let args = fs::read_to_string(&args_path).expect("read agent args");
-        assert!(args.contains("--resume"));
-        assert!(args.contains(&session_id));
-        assert!(!args.contains("fresh prompt"));
-        assert!(!args.contains("--print"));
+        assert_eq!(checkpoint.resumability, Resumability::Partial);
+        assert!(
+            error
+                .to_string()
+                .contains("cannot be rewound: agent context is unavailable")
+        );
+        assert!(!args_path.exists());
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
     #[test]
-    fn non_claude_resume_keeps_existing_behavior() {
-        let _guard = test_lock().lock().expect("lock tests");
+    fn non_claude_rewind_keeps_existing_behavior() {
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("codex-resume");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1618,7 +2201,7 @@ mod tests {
             )
             .expect("create checkpoint");
         fs::remove_file(&args_path).ok();
-        let exit_code = store.resume(&checkpoint.id).expect("resume checkpoint");
+        let exit_code = store.rewind(&checkpoint.id).expect("rewind checkpoint");
         std::env::set_current_dir(previous).expect("restore cwd");
 
         assert_eq!(exit_code, 0);
@@ -1631,7 +2214,7 @@ mod tests {
 
     #[test]
     fn fork_clones_checkpoint_into_new_timeline() {
-        let _guard = test_lock().lock().expect("lock tests");
+        let _guard = lock_tests();
         let repo_root = create_temp_repo("fork");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
@@ -1676,6 +2259,18 @@ mod tests {
             .arg(&path)
             .output()
             .expect("git init");
+        path
+    }
+
+    fn create_temp_home(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ddl-home-test-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).expect("create temp home");
         path
     }
 
@@ -1732,5 +2327,97 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("chmod script");
         path.display().to_string()
+    }
+
+    fn create_fake_claude_resume_script(
+        repo_root: &Path,
+        name: &str,
+        args_output: &Path,
+        transcript_output: &Path,
+        history_output: &Path,
+        home_dir: &Path,
+        repo_root_for_project: &Path,
+        session_id: &str,
+    ) -> String {
+        let path = repo_root.join(name);
+        let transcript_path =
+            claude_transcript_path_for_test(home_dir, repo_root_for_project, session_id);
+        let file_history_path = claude_file_history_path_for_test(home_dir, session_id);
+        let mut file = fs::File::create(&path).expect("create script");
+        writeln!(
+            file,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}' > '{}'\nif [ -d '{}' ]; then ls -1 '{}' | sort > '{}'; else : > '{}'; fi\n",
+            args_output.display(),
+            transcript_path.display(),
+            transcript_output.display(),
+            file_history_path.display(),
+            file_history_path.display(),
+            history_output.display(),
+            history_output.display(),
+        )
+        .expect("write script");
+        let mut permissions = fs::metadata(&path).expect("stat script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod script");
+        path.display().to_string()
+    }
+
+    fn seed_claude_local_state(
+        home_dir: &Path,
+        repo_root: &Path,
+        session_id: &str,
+        transcript: &str,
+        history_files: &[(&str, &str)],
+    ) {
+        let transcript_path = claude_transcript_path_for_test(home_dir, repo_root, session_id);
+        if let Some(parent) = transcript_path.parent() {
+            fs::create_dir_all(parent).expect("create transcript dir");
+        }
+        fs::write(&transcript_path, transcript).expect("write transcript");
+
+        let file_history_path = claude_file_history_path_for_test(home_dir, session_id);
+        if file_history_path.exists() {
+            fs::remove_dir_all(&file_history_path).expect("reset file history");
+        }
+        fs::create_dir_all(&file_history_path).expect("create file history dir");
+        for (name, contents) in history_files {
+            fs::write(file_history_path.join(name), contents).expect("write file history");
+        }
+    }
+
+    fn claude_transcript_path_for_test(
+        home_dir: &Path,
+        repo_root: &Path,
+        session_id: &str,
+    ) -> PathBuf {
+        home_dir
+            .join(".claude")
+            .join("projects")
+            .join(super::DaedalusStore::claude_project_key(repo_root))
+            .join(format!("{session_id}.jsonl"))
+    }
+
+    fn claude_file_history_path_for_test(home_dir: &Path, session_id: &str) -> PathBuf {
+        home_dir
+            .join(".claude")
+            .join("file-history")
+            .join(session_id)
+    }
+
+    fn set_home(home_dir: &Path) -> Option<std::ffi::OsString> {
+        let previous = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home_dir);
+        }
+        previous
+    }
+
+    fn restore_home(previous: Option<std::ffi::OsString>) {
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 }

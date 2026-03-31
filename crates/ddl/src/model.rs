@@ -206,6 +206,7 @@ pub struct CheckpointRecord {
     pub trigger_command: Option<String>,
     pub runtime_name: Option<String>,
     pub claude_session_id: Option<String>,
+    pub claude_rewind_rel_path: Option<String>,
     pub fingerprint: RuntimeFingerprint,
 }
 
@@ -226,6 +227,7 @@ impl CheckpointRecord {
             trigger_command: optional_value(&map, "trigger_command"),
             runtime_name: optional_value(&map, "runtime_name"),
             claude_session_id: optional_value(&map, "claude_session_id"),
+            claude_rewind_rel_path: optional_value(&map, "claude_rewind_rel_path"),
             fingerprint: RuntimeFingerprint {
                 cwd: required_value(&map, "cwd")?,
                 repo_root: required_value(&map, "repo_root")?,
@@ -268,6 +270,9 @@ impl CheckpointRecord {
         }
         if let Some(claude_session_id) = &self.claude_session_id {
             pairs.push(("claude_session_id", claude_session_id.clone()));
+        }
+        if let Some(claude_rewind_rel_path) = &self.claude_rewind_rel_path {
+            pairs.push(("claude_rewind_rel_path", claude_rewind_rel_path.clone()));
         }
         write_pairs(path, &pairs)
     }
