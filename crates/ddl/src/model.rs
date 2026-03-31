@@ -10,7 +10,6 @@ pub enum RunStatus {
     Running,
     Succeeded,
     Failed,
-    Forked,
 }
 
 impl RunStatus {
@@ -20,7 +19,6 @@ impl RunStatus {
             Self::Running => "running",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
-            Self::Forked => "forked",
         }
     }
 
@@ -30,7 +28,6 @@ impl RunStatus {
             "running" => Ok(Self::Running),
             "succeeded" => Ok(Self::Succeeded),
             "failed" => Ok(Self::Failed),
-            "forked" => Ok(Self::Forked),
             _ => Err(DdlError::InvalidState(format!(
                 "unknown run status `{value}`"
             ))),
@@ -85,10 +82,7 @@ pub struct RuntimeFingerprint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TimelineRecord {
     pub id: String,
-    pub name: Option<String>,
     pub run_id: String,
-    pub root_checkpoint_id: Option<String>,
-    pub source_checkpoint_id: Option<String>,
     pub created_at: u64,
 }
 
@@ -97,29 +91,17 @@ impl TimelineRecord {
         let map = read_pairs(path)?;
         Ok(Self {
             id: required_value(&map, "id")?,
-            name: optional_value(&map, "name"),
             run_id: required_value(&map, "run_id")?,
-            root_checkpoint_id: optional_value(&map, "root_checkpoint_id"),
-            source_checkpoint_id: optional_value(&map, "source_checkpoint_id"),
             created_at: required_value(&map, "created_at")?.parse()?,
         })
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        let mut pairs = vec![
+        let pairs = vec![
             ("id", self.id.clone()),
             ("run_id", self.run_id.clone()),
             ("created_at", self.created_at.to_string()),
         ];
-        if let Some(root_checkpoint_id) = &self.root_checkpoint_id {
-            pairs.push(("root_checkpoint_id", root_checkpoint_id.clone()));
-        }
-        if let Some(name) = &self.name {
-            pairs.push(("name", name.clone()));
-        }
-        if let Some(source) = &self.source_checkpoint_id {
-            pairs.push(("source_checkpoint_id", source.clone()));
-        }
         write_pairs(path, &pairs)
     }
 }

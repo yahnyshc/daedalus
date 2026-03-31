@@ -172,10 +172,7 @@ impl DaedalusStore {
 
         let timeline = TimelineRecord {
             id: timeline_id.clone(),
-            name: Some("main".to_string()),
             run_id: run_id.clone(),
-            root_checkpoint_id: None,
-            source_checkpoint_id: None,
             created_at,
         };
         self.write_timeline(&timeline)?;
@@ -366,45 +363,6 @@ impl DaedalusStore {
         Ok(status.code().unwrap_or(1))
     }
 
-    pub fn fork(&self, checkpoint_id: &str, name: Option<String>) -> Result<(String, String)> {
-        self.ensure_initialized()?;
-        let source = self.read_checkpoint(checkpoint_id)?;
-        let source_run = self.read_run(&source.run_id)?;
-
-        let timeline_id = next_id("tl");
-        let run_id = next_id("run");
-        let checkpoint = self.clone_checkpoint(
-            &source,
-            &timeline_id,
-            &run_id,
-            "fork-root".to_string(),
-            None,
-        )?;
-
-        let timeline = TimelineRecord {
-            id: timeline_id.clone(),
-            name,
-            run_id: run_id.clone(),
-            root_checkpoint_id: Some(checkpoint.id.clone()),
-            source_checkpoint_id: Some(source.id),
-            created_at: unix_timestamp(),
-        };
-        self.write_timeline(&timeline)?;
-
-        let run = RunRecord {
-            id: run_id.clone(),
-            timeline_id: timeline_id.clone(),
-            command: source_run.command,
-            created_at: unix_timestamp(),
-            status: RunStatus::Forked,
-            last_checkpoint_id: Some(checkpoint.id),
-            resumability: checkpoint.resumability.clone(),
-        };
-        self.write_run(&run)?;
-
-        Ok((timeline_id, run_id))
-    }
-
     pub fn restore(&self, checkpoint_id: &str) -> Result<()> {
         self.ensure_initialized()?;
         let checkpoint = self.read_checkpoint(checkpoint_id)?;
@@ -515,17 +473,6 @@ impl DaedalusStore {
         RunRecord::read(&path)
     }
 
-    pub fn read_timeline(&self, timeline_id: &str) -> Result<TimelineRecord> {
-        let path = self.timelines_dir.join(format!("{timeline_id}.meta"));
-        if !path.exists() {
-            return Err(DdlError::NotFound {
-                kind: "timeline",
-                id: timeline_id.to_string(),
-            });
-        }
-        TimelineRecord::read(&path)
-    }
-
     pub fn read_checkpoint(&self, checkpoint_id: &str) -> Result<CheckpointRecord> {
         let path = self.checkpoints_dir.join(format!("{checkpoint_id}.meta"));
         if !path.exists() {
@@ -578,10 +525,7 @@ impl DaedalusStore {
 
         let timeline = TimelineRecord {
             id: timeline_id.clone(),
-            name: Some("shell".to_string()),
             run_id: run_id.clone(),
-            root_checkpoint_id: None,
-            source_checkpoint_id: None,
             created_at,
         };
         self.write_timeline(&timeline)?;
@@ -643,7 +587,6 @@ impl DaedalusStore {
         invocation: &ToolInvocation,
     ) -> Result<CheckpointRecord> {
         let mut run = self.read_run(run_id)?;
-        let mut timeline = self.read_timeline(timeline_id)?;
 
         let checkpoint = self.create_checkpoint_internal(
             timeline_id,
@@ -659,11 +602,6 @@ impl DaedalusStore {
 
         run.last_checkpoint_id = Some(checkpoint.id.clone());
         self.write_run(&run)?;
-
-        if timeline.root_checkpoint_id.is_none() {
-            timeline.root_checkpoint_id = Some(checkpoint.id.clone());
-            self.write_timeline(&timeline)?;
-        }
 
         Ok(checkpoint)
     }
@@ -815,85 +753,6 @@ impl DaedalusStore {
         Ok(checkpoint)
     }
 
-    fn clone_checkpoint(
-        &self,
-        source: &CheckpointRecord,
-        timeline_id: &str,
-        run_id: &str,
-        reason: String,
-        parent_checkpoint_id: Option<String>,
-    ) -> Result<CheckpointRecord> {
-        let checkpoint_id = next_id("cp");
-        let snapshot_rel_path = format!("{SNAPSHOT_DIR_NAME}/{checkpoint_id}");
-        let new_snapshot = self.snapshot_path(&snapshot_rel_path);
-        fs::create_dir_all(&new_snapshot)?;
-        let source_snapshot = self.snapshot_path(&source.snapshot_rel_path);
-        copy_dir_contents(&source_snapshot, &new_snapshot)?;
-        let claude_rewind_rel_path = self.clone_claude_local_state(
-            source.claude_rewind_rel_path.as_deref(),
-            run_id,
-            &checkpoint_id,
-        )?;
-
-        run_command(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.shadow_dir)
-                .arg("add")
-                .arg(&snapshot_rel_path)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()),
-            "git add",
-        )?;
-
-        run_command(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.shadow_dir)
-                .arg("commit")
-                .arg("-m")
-                .arg(format!("fork checkpoint {checkpoint_id}"))
-                .arg("--allow-empty")
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped()),
-            "git commit",
-        )?;
-
-        let shadow_commit = read_git_output(
-            Command::new("git")
-                .arg("-C")
-                .arg(&self.shadow_dir)
-                .arg("rev-parse")
-                .arg("HEAD"),
-            "git rev-parse",
-        )?;
-
-        let checkpoint = CheckpointRecord {
-            id: checkpoint_id,
-            timeline_id: timeline_id.to_string(),
-            run_id: run_id.to_string(),
-            parent_checkpoint_id,
-            reason,
-            snapshot_rel_path,
-            shadow_commit,
-            created_at: unix_timestamp(),
-            resumability: self.compute_checkpoint_resumability(
-                &new_snapshot,
-                source.runtime_name.as_deref(),
-                source.claude_session_id.as_deref(),
-                claude_rewind_rel_path.as_deref(),
-            ),
-            trigger_tool_type: None,
-            trigger_command: None,
-            runtime_name: source.runtime_name.clone(),
-            claude_session_id: source.claude_session_id.clone(),
-            claude_rewind_rel_path,
-            fingerprint: source.fingerprint.clone(),
-        };
-        self.write_checkpoint(&checkpoint)?;
-        Ok(checkpoint)
-    }
-
     fn capture_fingerprint(&self) -> Result<RuntimeFingerprint> {
         let git_head = read_git_output_or_default(
             Command::new("git")
@@ -1039,36 +898,6 @@ impl DaedalusStore {
             fs::remove_dir_all(&snapshot_path)?;
             Ok(None)
         }
-    }
-
-    fn clone_claude_local_state(
-        &self,
-        source_relative: Option<&str>,
-        run_id: &str,
-        checkpoint_id: &str,
-    ) -> Result<Option<String>> {
-        let Some(source_relative) = source_relative else {
-            return Ok(None);
-        };
-        let source_path = self.state_dir.join(source_relative);
-        if !source_path.exists() {
-            return Ok(None);
-        }
-
-        let destination = self.claude_checkpoint_state_path(run_id, checkpoint_id);
-        if destination.exists() {
-            fs::remove_dir_all(&destination)?;
-        }
-        fs::create_dir_all(&destination)?;
-        copy_dir_contents(&source_path, &destination)?;
-
-        Ok(Some(
-            destination
-                .strip_prefix(&self.state_dir)
-                .unwrap_or(&destination)
-                .display()
-                .to_string(),
-        ))
     }
 
     fn restore_claude_local_state(
@@ -1554,7 +1383,6 @@ mod tests {
 
         let timelines = store.list_timelines().expect("list timelines");
         assert_eq!(timelines.len(), 1);
-        assert_eq!(timelines[0].name.as_deref(), Some("shell"));
 
         let checkpoints = store.list_checkpoints().expect("list checkpoints");
         assert_eq!(checkpoints.len(), 1);
@@ -2234,39 +2062,6 @@ mod tests {
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
 
-    #[test]
-    fn fork_clones_checkpoint_into_new_timeline() {
-        let _guard = lock_tests();
-        let repo_root = create_temp_repo("fork");
-
-        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
-        store.init().expect("initialize store");
-        fs::write(repo_root.join("README.md"), "hello").expect("seed file");
-
-        let previous = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(&repo_root).expect("cd temp repo");
-        store
-            .run_shell_command(vec!["rm".to_string(), "README.md".to_string()])
-            .expect("run shell");
-        std::env::set_current_dir(previous).expect("restore cwd");
-
-        let checkpoint_id = store
-            .list_checkpoints()
-            .expect("checkpoints")
-            .last()
-            .expect("checkpoint")
-            .id
-            .clone();
-
-        let (timeline_id, run_id) = store
-            .fork(&checkpoint_id, Some("alt".to_string()))
-            .expect("fork");
-        assert!(!timeline_id.is_empty());
-        assert!(!run_id.is_empty());
-
-        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
-    }
-
     fn create_temp_repo(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "ddl-store-test-{name}-{}",
@@ -2311,10 +2106,7 @@ mod tests {
         store
             .write_timeline(&TimelineRecord {
                 id: timeline_id.clone(),
-                name: Some("main".to_string()),
                 run_id: run_id.clone(),
-                root_checkpoint_id: None,
-                source_checkpoint_id: None,
                 created_at,
             })
             .expect("write timeline");

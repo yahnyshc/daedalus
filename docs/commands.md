@@ -8,15 +8,14 @@ Internally, rule matching now flows through a shared tool invocation model so fu
   Claude gets a session-scoped `PreToolUse` hook for `Edit|MultiEdit|Write|Bash`, while Codex keeps the checkpointed Bash shell path.
 - `ddl shell -- <command>` executes a shell command through the same matcher and checkpoint path used by wrapped runtimes.
 - `ddl log` is TTY-aware:
-  in an interactive terminal it opens a recovery console with recent timelines, timeline drilldown, diff inspection, and recovery actions.
+  in an interactive terminal it opens a recovery console with recent sessions, session history drilldown, diff inspection, and recovery actions.
   In non-interactive contexts it keeps the plain text log output for scripts and pipes.
 - `ddl log` reports restore availability separately from rewind availability, so users can choose repo-only recovery or agent-context recovery explicitly.
 - `ddl diff` compares checkpoint snapshots with `git diff --no-index`.
 - `ddl restore` copies a checkpoint snapshot back into the workspace.
-- `ddl rewind` restores a checkpoint and rewinds the owned runtime on the same timeline.
+- `ddl rewind` restores a checkpoint and rewinds the owned runtime on the same session.
   Claude-backed checkpoints first restore the experimental best-effort local Claude rewind snapshot, then launch `claude --resume <session_id>`.
   If checkpoint-head agent context is unavailable, `ddl rewind` fails clearly and the user should use `ddl restore` instead.
-- `ddl fork` creates a new timeline rooted in an existing checkpoint.
 
 Current v1 limits:
 

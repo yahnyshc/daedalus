@@ -5,7 +5,10 @@ use std::io::Read;
 
 use crate::error::{DdlError, Result};
 use crate::log_ui::{LogUiExit, run_log_ui};
-use crate::model::Resumability;
+use crate::presentation::{
+    RecoveryCapability, format_absolute_time, latest_action_label, recovery_capability,
+    session_status_label, session_title, tool_event_label, tool_event_preview,
+};
 use crate::store::DaedalusStore;
 
 pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
@@ -87,12 +90,6 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             let store = DaedalusStore::discover()?;
             store.rewind(&checkpoint)
         }
-        CommandLine::Fork { checkpoint, name } => {
-            let store = DaedalusStore::discover()?;
-            let (timeline_id, run_id) = store.fork(&checkpoint, name)?;
-            println!("created fork timeline {timeline_id} with run {run_id}");
-            Ok(0)
-        }
     }
 }
 
@@ -117,10 +114,6 @@ enum CommandLine {
     },
     Rewind {
         checkpoint: String,
-    },
-    Fork {
-        checkpoint: String,
-        name: Option<String>,
     },
 }
 
@@ -149,17 +142,6 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         "resume" => Err(DdlError::InvalidInput(
             "`ddl resume` was removed; use `ddl rewind <checkpoint_id>` for agent-context rewind or `ddl restore <checkpoint_id>` for repo-only recovery".to_string(),
         )),
-        "fork" => {
-            if parts.len() < 3 {
-                return Err(DdlError::InvalidInput(
-                    "usage: ddl fork <checkpoint_id> [name]".to_string(),
-                ));
-            }
-            Ok(CommandLine::Fork {
-                checkpoint: parts[2].clone(),
-                name: parts.get(3).cloned(),
-            })
-        }
         other => Err(DdlError::InvalidInput(format!(
             "unknown command `{other}`; run `ddl --help` for usage"
         ))),
@@ -262,56 +244,54 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
     let mut output = String::new();
 
     if timelines.is_empty() {
-        output.push_str("no timelines recorded\n");
+        output.push_str("no sessions recorded\n");
         return Ok(output);
     }
 
-    for timeline in timelines {
-        let label = timeline
-            .name
-            .as_deref()
-            .map(|name| format!(" ({name})"))
-            .unwrap_or_default();
-        let _ = writeln!(output, "timeline {}{}", timeline.id, label);
-        let _ = writeln!(output, "  run: {}", timeline.run_id);
-        if let Some(root_checkpoint_id) = &timeline.root_checkpoint_id {
-            let _ = writeln!(output, "  root checkpoint: {root_checkpoint_id}");
-        } else {
-            output.push_str("  root checkpoint: none yet\n");
-        }
-        if let Some(source) = &timeline.source_checkpoint_id {
-            let _ = writeln!(output, "  source checkpoint: {source}");
-        }
-
-        for checkpoint in checkpoints
+    output.push_str("Recent Sessions\n");
+    for timeline in timelines.into_iter().rev() {
+        let run = store.read_run(&timeline.run_id)?;
+        let session_checkpoints = checkpoints
             .iter()
             .filter(|checkpoint| checkpoint.timeline_id == timeline.id)
-        {
-            let trigger = checkpoint
-                .trigger_command
-                .as_deref()
-                .map(|command| format!(" ({command})"))
-                .unwrap_or_default();
+            .collect::<Vec<_>>();
+        let latest_checkpoint = session_checkpoints.last().copied();
+        let capability = latest_checkpoint
+            .map(recovery_capability)
+            .unwrap_or(RecoveryCapability::Unavailable);
+
+        let _ = writeln!(output, "{}", session_title(&timeline, &run));
+        let _ = writeln!(
+            output,
+            "  Started: {}  |  {} protected actions  |  {}",
+            format_absolute_time(timeline.created_at),
+            session_checkpoints.len(),
+            capability.label()
+        );
+        let _ = writeln!(
+            output,
+            "  Status: {}  |  Latest protected action: {}",
+            session_status_label(&run.status),
+            latest_action_label(latest_checkpoint)
+        );
+
+        if session_checkpoints.is_empty() {
+            output.push_str("  No protected actions recorded yet.\n");
+            continue;
+        }
+
+        output.push_str("  Protected actions:\n");
+        for checkpoint in session_checkpoints.into_iter().rev() {
             let _ = writeln!(
                 output,
-                "  checkpoint {} {}{}",
-                checkpoint.id, checkpoint.reason, trigger
+                "    {}  |  {}  |  {}",
+                tool_event_label(checkpoint),
+                crate::presentation::format_relative_time(checkpoint.created_at),
+                recovery_capability(checkpoint).label()
             );
-            let restore_status = match checkpoint.resumability {
-                Resumability::Unavailable => "Restore: unavailable",
-                _ => "Restore: available",
-            };
-            let rewind_status = match (
-                checkpoint.runtime_name.as_deref(),
-                checkpoint.resumability.as_str(),
-            ) {
-                (_, "unavailable") => "Rewind: unavailable",
-                (Some("claude"), "full") => "Rewind: available",
-                (Some("claude"), "partial") => "Rewind: unavailable (restore only)",
-                _ => "Rewind: available",
-            };
-            let _ = writeln!(output, "    {restore_status}");
-            let _ = writeln!(output, "    {rewind_status}");
+            if let Some(preview) = tool_event_preview(checkpoint) {
+                let _ = writeln!(output, "      {preview}");
+            }
         }
     }
 
@@ -331,7 +311,6 @@ Usage:
   ddl diff [checkpoint_a] [checkpoint_b]
   ddl restore <checkpoint_id>
   ddl rewind <checkpoint_id>
-  ddl fork <checkpoint_id> [name]
 "
     );
 }
@@ -359,10 +338,7 @@ mod tests {
         let created_at = 1;
         TimelineRecord {
             id: "tl_test".to_string(),
-            name: Some("main".to_string()),
             run_id: "run_test".to_string(),
-            root_checkpoint_id: Some("cp_test".to_string()),
-            source_checkpoint_id: None,
             created_at,
         }
         .write(&repo_root.join(".daedalus/timelines/tl_test.meta"))
@@ -437,17 +413,19 @@ mod tests {
         .expect("write full checkpoint");
 
         let output = render_log(&store).expect("render log");
-        assert!(output.contains("checkpoint cp_test before-edit (src/main.rs)"));
-        assert!(output.contains("Restore: available"));
-        assert!(output.contains("Rewind: unavailable (restore only)"));
-        assert!(output.contains("checkpoint cp_full before-shell (rm README.md)"));
-        assert!(output.contains("Rewind: available"));
+        assert!(output.contains("Recent Sessions"));
+        assert!(output.contains("Claude session"));
+        assert!(output.contains("Status: Active"));
+        assert!(output.contains("Edit src/main.rs"));
+        assert!(output.contains("Restore only"));
+        assert!(output.contains("Bash rm README.md"));
+        assert!(output.contains("Rewindable"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
 
     #[test]
-    fn parse_arguments_accepts_rewind_and_rejects_resume() {
+    fn parse_arguments_accepts_rewind_and_rejects_removed_commands() {
         match parse_arguments([
             OsString::from("ddl"),
             OsString::from("rewind"),
@@ -470,6 +448,14 @@ mod tests {
                 .to_string()
                 .contains("`ddl resume` was removed; use `ddl rewind <checkpoint_id>`")
         );
+
+        let error = parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("fork"),
+            OsString::from("cp_test"),
+        ])
+        .expect_err("fork should be removed");
+        assert!(error.to_string().contains("unknown command `fork`"));
     }
 
     fn create_temp_repo(name: &str) -> PathBuf {

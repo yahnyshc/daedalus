@@ -4,7 +4,7 @@
 
 It is built for the moment right before an agent does something unsafe, and for the moment right after you realize it was a mistake.
 
-The goal is simple: restore the exact repo/workspace state and, when available, rewind the agent context immediately before a risky action, then either continue the same timeline or fork a new one.
+The goal is simple: restore the exact repo/workspace state and, when available, rewind the agent context immediately before a risky action.
 
 ## The Problem
 
@@ -36,7 +36,7 @@ It runs a supported agent under protection, saves checkpoints before configured 
 
 The key promise is:
 
-> Restore the exact repo/workspace state and the agent context immediately before a risky action, then rewind or fork from there.
+> Restore the exact repo/workspace state and the agent context immediately before a risky action, then rewind from there when agent context is available.
 
 ## Core Workflow
 
@@ -48,7 +48,7 @@ The public workflow is:
 4. the action goes bad
 5. `ddl restore <checkpoint_id>`
 6. workspace returns to the pre-action state
-7. `ddl rewind <checkpoint_id>` or `ddl fork <checkpoint_id> [name]`
+7. `ddl rewind <checkpoint_id>`
 8. the agent continues from the saved context
 
 This is why v1 is CLI-first. `daedalus` needs to own or observe the run in order to protect it properly.
@@ -93,7 +93,6 @@ ddl log
 ddl diff [checkpoint_a] [checkpoint_b]
 ddl restore <checkpoint_id>
 ddl rewind <checkpoint_id>
-ddl fork <checkpoint_id> [name]
 ```
 
 Command intent:
@@ -101,11 +100,10 @@ Command intent:
 - `ddl init`: initialize `daedalus` state for the repo
 - `ddl run`: execute a supported agent runtime under protection
 - `ddl shell`: execute a shell command through `daedalus`' checkpoint matcher
-- `ddl log`: inspect recent execution timelines in an interactive recovery console when attached to a TTY, or emit plain text in non-interactive contexts
+- `ddl log`: inspect recent sessions in an interactive recovery console when attached to a TTY, or emit plain text in non-interactive contexts
 - `ddl diff`: inspect file and metadata differences between checkpoints
 - `ddl restore`: return workspace and checkpoint metadata to a known point without launching the agent
-- `ddl rewind`: restore workspace and, when available, continue the same timeline from a checkpoint with saved agent context
-- `ddl fork`: create a new execution timeline from a checkpoint without mutating the original one
+- `ddl rewind`: restore workspace and, when available, continue the same session from a checkpoint with saved agent context
 
 Manual checkpoint commands are deliberately not in the first public story. The core value is automatic protection, not asking users to remember another save button.
 
@@ -144,15 +142,12 @@ Older repos that only have the legacy `.daedalus/config` file must be re-initial
 
 - `checkpoint`: a saved execution point before an unsafe action
 - `restore`: return workspace and checkpoint metadata to that point
-- `rewind`: continue the same execution timeline from that checkpoint when agent context can be restored
-- `fork`: create a new execution timeline from that checkpoint
-- `timeline`: the ordered history of checkpoints for one protected run
-
-`fork` is intentionally not called `branch` in the public interface. A git branch points to source history. A `daedalus` fork represents execution history.
+- `rewind`: continue the same protected session from that checkpoint when agent context can be restored
+- `session history`: the ordered history of protected actions for one run
 
 ## How It Works
 
-The implementation goal is a repo-local hidden state store with content-addressed semantics and cheap checkpointing, diffing, restore, and forking.
+The implementation goal is a repo-local hidden state store with content-addressed semantics and cheap checkpointing, diffing, restore, and rewind.
 
 The exact storage internals can evolve. Using git primitives or a shadow git repository internally is acceptable. That is an implementation detail, not the product model.
 
@@ -162,8 +157,7 @@ The user model should stay simple:
 - checkpoints
 - restore
 - rewind
-- forks
-- timelines
+- session history
 
 ## Integration Model
 
@@ -181,7 +175,7 @@ Tertiary:
 
 - agent-specific hooks where supported for automatic checkpointing around tool execution
 
-MCP matters because it lets agents call `restore`, `rewind`, `fork`, `diff`, and `log` as first-class tools.
+MCP matters because it lets agents call `restore`, `rewind`, `diff`, and `log` as first-class tools.
 
 But MCP alone is not enough. The core value of `daedalus` is automatic protection before a risky action, which usually requires a wrapper or a hook surface.
 
@@ -222,12 +216,6 @@ ddl restore cp_42
 ddl rewind cp_42
 ```
 
-Or, if the user wants an alternate path:
-
-```bash
-ddl fork cp_42 alt-fix
-```
-
 That is the product in one sequence.
 
 ## Why Rust
@@ -248,7 +236,7 @@ Near-term extensions after the core demo:
 - MCP server backed by the same core engine
 - hook-based integrations for supported agent runtimes
 - richer checkpoint diff views across files, approvals, and tool outputs
-- explicit export or sync flows into git when users want to turn a recovered timeline into source history
+- explicit export or sync flows into git when users want to turn a recovered session into source history
 
 ## Non-Goals for v1
 
@@ -261,11 +249,11 @@ Near-term extensions after the core demo:
 
 This repo now includes a working shell-first v1 implementation. It keeps the repo-local state model and shadow git-backed checkpoint storage from the scaffold, but moves automatic checkpointing to wrapped mutation boundaries instead of creating checkpoints at run start. Claude Code sessions now also checkpoint before supported edit and Bash tools through an injected `PreToolUse` hook.
 
-`ddl log` is now TTY-aware: in an interactive terminal it becomes a recovery console with recent timelines, checkpoint drilldown, diff inspection, and direct restore/rewind/fork actions. In non-interactive contexts it keeps the plain text log output.
+`ddl log` is now TTY-aware: in an interactive terminal it becomes a recovery console with recent sessions, protected action history, diff inspection, and direct restore/rewind actions. In non-interactive contexts it keeps the plain text log output.
 
 The implementation should stay anchored to the same promise:
 
-protect agent runs, checkpoint before risky actions, restore cleanly, then rewind or fork from the exact decision point.
+protect agent runs, checkpoint before risky actions, restore cleanly, then rewind from the exact decision point.
 
 ## Current Base
 
@@ -273,7 +261,7 @@ The current base provides:
 
 - a Rust workspace with the `ddl` CLI crate
 - repo-local `.daedalus/` state initialization with `.daedalus/config.json`
-- timeline, run, and checkpoint metadata records
+- session, run, and checkpoint metadata records
 - shadow git-backed snapshot storage under `.daedalus/shadow/`
 - `ddl run` wrapper mode for `codex` and `claude`
 - `ddl shell` for direct shell execution through the matcher

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Stdout};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -18,13 +18,19 @@ use ratatui::{Frame, Terminal};
 
 use crate::error::Result;
 use crate::model::{CheckpointRecord, RunRecord, TimelineRecord};
-use crate::runtime::SupportedRuntime;
+use crate::presentation::{
+    RecoveryCapability, format_absolute_time, format_relative_time, format_runtime,
+    latest_action_label, recovery_capability, session_status_label, session_title,
+    tool_event_label, tool_event_preview,
+};
 use crate::store::DaedalusStore;
 
 pub enum LogUiExit {
     Quit,
     Rewind(String),
 }
+
+const LIST_HIGHLIGHT_SYMBOL: &str = "› ";
 
 pub fn run_log_ui(store: &DaedalusStore) -> Result<LogUiExit> {
     let mut session = TerminalSession::new()?;
@@ -94,24 +100,15 @@ enum DiffFocus {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoveryBadge {
-    Rewind,
-    RestoreOnly,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingActionKind {
     Restore,
     Rewind,
-    Fork,
 }
 
 #[derive(Clone)]
 struct PendingAction {
     kind: PendingActionKind,
     checkpoint_id: String,
-    fork_name: String,
 }
 
 struct LogUiApp {
@@ -186,11 +183,11 @@ impl LogUiApp {
     fn handle_timelines_key(&mut self, key: KeyEvent) -> Result<Option<LogUiExit>> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => Ok(Some(LogUiExit::Quit)),
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 move_selection(&mut self.timeline_state, self.timelines.len(), 1);
                 Ok(None)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 move_selection(&mut self.timeline_state, self.timelines.len(), -1);
                 Ok(None)
             }
@@ -229,11 +226,11 @@ impl LogUiApp {
                 self.status_message = None;
                 Ok(None)
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 move_selection(&mut self.checkpoint_state, checkpoints_len, 1);
                 Ok(None)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 move_selection(&mut self.checkpoint_state, checkpoints_len, -1);
                 Ok(None)
             }
@@ -255,10 +252,6 @@ impl LogUiApp {
             }
             KeyCode::Char('w') => {
                 self.begin_action(PendingActionKind::Rewind);
-                Ok(None)
-            }
-            KeyCode::Char('f') => {
-                self.begin_action(PendingActionKind::Fork);
                 Ok(None)
             }
             _ => Ok(None),
@@ -300,15 +293,11 @@ impl LogUiApp {
                 self.begin_action(PendingActionKind::Rewind);
                 Ok(None)
             }
-            KeyCode::Char('f') => {
-                self.begin_action(PendingActionKind::Fork);
-                Ok(None)
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 self.move_diff_focus(1);
                 Ok(None)
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 self.move_diff_focus(-1);
                 Ok(None)
             }
@@ -338,22 +327,6 @@ impl LogUiApp {
                 self.modal = None;
                 Ok(None)
             }
-            KeyCode::Backspace if modal.kind == PendingActionKind::Fork => {
-                if let Some(active_modal) = self.modal.as_mut() {
-                    active_modal.fork_name.pop();
-                }
-                Ok(None)
-            }
-            KeyCode::Char(character)
-                if modal.kind == PendingActionKind::Fork
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                if let Some(active_modal) = self.modal.as_mut() {
-                    active_modal.fork_name.push(character);
-                }
-                Ok(None)
-            }
             KeyCode::Enter => {
                 let action = modal.clone();
                 let outcome = match action.kind {
@@ -361,13 +334,6 @@ impl LogUiApp {
                         store.restore(&action.checkpoint_id)?;
                         self.status_message =
                             Some(format!("restored workspace to {}", action.checkpoint_id));
-                        self.refresh(store)?;
-                        None
-                    }
-                    PendingActionKind::Fork => {
-                        let name = trimmed_name(&action.fork_name);
-                        let (timeline_id, _) = store.fork(&action.checkpoint_id, name)?;
-                        self.status_message = Some(format!("created fork timeline {timeline_id}"));
                         self.refresh(store)?;
                         None
                     }
@@ -405,22 +371,23 @@ impl LogUiApp {
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(10), Constraint::Length(3)])
             .split(area);
+        let row_width = list_row_width(sections[0], LIST_HIGHLIGHT_SYMBOL);
 
         let items = if self.timelines.is_empty() {
             vec![ListItem::new(Line::from(
-                "No timelines recorded yet. Run `ddl run -- ...` or `ddl shell -- ...` first.",
+                "No sessions recorded yet. Run `ddl run -- ...` or `ddl shell -- ...` first.",
             ))]
         } else {
             self.timelines
                 .iter()
-                .map(|timeline| ListItem::new(timeline_row(timeline)))
+                .map(|timeline| ListItem::new(timeline_row(timeline, row_width)))
                 .collect::<Vec<_>>()
         };
 
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Recent Timelines ")
+                    .title(" Recent Sessions ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Thick),
             )
@@ -430,13 +397,13 @@ impl LogUiApp {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("› ");
+            .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
         frame.render_stateful_widget(list, sections[0], &mut self.timeline_state);
         frame.render_widget(
             footer_paragraph(
-                "Browse recent timelines",
+                "Browse recent sessions",
                 self.status_message.as_deref(),
-                "[j/k] move  [enter] checkpoints  [q] quit",
+                "[up/down] move  [enter] session history  [q] quit",
             ),
             sections[1],
         );
@@ -456,41 +423,41 @@ impl LogUiApp {
                 Constraint::Length(3),
             ])
             .split(area);
+        let row_width = list_row_width(sections[1], LIST_HIGHLIGHT_SYMBOL);
 
         let header = Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(
-                    timeline.display_name.clone(),
+                    timeline.title.clone(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    timeline.runtime_label.clone(),
-                    Style::default().fg(Color::Cyan),
+                    session_status_label(&timeline.run.status),
+                    status_style(&timeline.run),
                 ),
                 Span::raw("  "),
-                Span::styled(timeline.run.status.as_str(), status_style(&timeline.run)),
+                Span::styled(
+                    timeline.capability.label(),
+                    recovery_style(timeline.capability),
+                ),
             ]),
             Line::from(format!(
-                "{} checkpoints  |  latest {}  |  {}",
-                timeline.checkpoints.len(),
-                timeline
-                    .latest_checkpoint
-                    .as_deref()
-                    .unwrap_or("no checkpoint yet"),
-                format_timestamp(timeline.timeline.created_at)
+                "Started {}  |  Runtime {}  |  {} protected actions",
+                format_absolute_time(timeline.timeline.created_at),
+                timeline.runtime,
+                timeline.checkpoints.len()
             )),
             Line::from(format!(
-                "run {}  |  {}",
-                timeline.run.id,
-                recovery_label(timeline.recovery)
+                "Latest protected action: {}",
+                timeline.latest_action
             )),
         ]))
         .block(
             Block::default()
-                .title(" Timeline ")
+                .title(" Session ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Thick),
         );
@@ -498,20 +465,20 @@ impl LogUiApp {
 
         let items = if timeline.checkpoints.is_empty() {
             vec![ListItem::new(Line::from(
-                "No checkpoints recorded on this timeline yet.",
+                "No protected actions recorded in this session yet.",
             ))]
         } else {
             timeline
                 .checkpoints
                 .iter()
-                .map(|checkpoint| ListItem::new(checkpoint_row(checkpoint)))
+                .map(|checkpoint| ListItem::new(checkpoint_row(checkpoint, row_width)))
                 .collect::<Vec<_>>()
         };
 
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Checkpoints ")
+                    .title(" Protected Actions ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -521,13 +488,13 @@ impl LogUiApp {
                     .bg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol("› ");
+            .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
         frame.render_stateful_widget(list, sections[1], &mut self.checkpoint_state);
         frame.render_widget(
             footer_paragraph(
-                "Inspect checkpoints before recovering",
+                "Inspect protected actions before recovering",
                 self.status_message.as_deref(),
-                "[j/k] move  [enter] diff  [r] restore  [w] rewind  [f] fork  [esc] back  [q] quit",
+                "[up/down] move  [enter] diff  [r] restore  [w] rewind  [esc] back  [q] quit",
             ),
             sections[2],
         );
@@ -559,32 +526,29 @@ impl LogUiApp {
         let header = Paragraph::new(Text::from(vec![
             Line::from(vec![
                 Span::styled(
-                    checkpoint.checkpoint.id.clone(),
+                    checkpoint.label.clone(),
                     Style::default()
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    checkpoint.checkpoint.reason.clone(),
-                    Style::default().fg(Color::Cyan),
+                    checkpoint.capability.label(),
+                    recovery_style(checkpoint.capability),
                 ),
                 Span::raw("  "),
                 Span::styled(
-                    recovery_label(checkpoint.recovery),
-                    recovery_style(checkpoint.recovery),
+                    format_relative_time(checkpoint.checkpoint.created_at),
+                    Style::default().fg(Color::Cyan),
                 ),
             ]),
             Line::from(format!(
-                "{}  |  {}  |  {}",
-                timeline.display_name,
-                self.diff_panel.compare_label,
-                checkpoint
-                    .checkpoint
-                    .trigger_command
-                    .as_deref()
-                    .unwrap_or("no trigger command")
+                "{}  |  {}",
+                timeline.title, self.diff_panel.compare_label
             )),
+            Line::from(checkpoint.preview.clone().unwrap_or_else(|| {
+                "Review the file changes before you restore or rewind.".to_string()
+            })),
         ]))
         .block(
             Block::default()
@@ -647,7 +611,7 @@ impl LogUiApp {
             footer_paragraph(
                 "Diff is the recovery decision point",
                 self.status_message.as_deref(),
-                "[tab] switch pane  [j/k] scroll  [c] compare mode  [r] restore  [w] rewind  [f] fork  [esc] back  [q] quit",
+                "[tab] switch pane  [up/down] scroll  [c] compare mode  [r] restore  [w] rewind  [esc] back  [q] quit",
             ),
             sections[2],
         );
@@ -669,29 +633,22 @@ impl LogUiApp {
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
-            Line::from(format!("checkpoint {}", modal.checkpoint_id)),
         ];
+
+        if let Some(checkpoint) = self.selected_checkpoint() {
+            lines.push(Line::from(checkpoint.label.clone()));
+        }
 
         match modal.kind {
             PendingActionKind::Restore => {
                 lines.push(Line::from(
-                    "This restores the workspace snapshot and keeps you in the console.",
+                    "This restores the workspace snapshot and keeps you in session history.",
                 ));
             }
             PendingActionKind::Rewind => {
                 lines.push(Line::from(
                     "This restores the snapshot and exits into the resumed runtime.",
                 ));
-            }
-            PendingActionKind::Fork => {
-                lines.push(Line::from(
-                    "Create a new timeline rooted at this checkpoint.",
-                ));
-                lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled("name: ", Style::default().fg(Color::Cyan)),
-                    Span::raw(modal.fork_name.as_str()),
-                ]));
             }
         }
 
@@ -800,12 +757,16 @@ impl LogUiApp {
             return;
         };
 
-        if kind == PendingActionKind::Rewind && checkpoint.recovery != RecoveryBadge::Rewind {
+        if kind == PendingActionKind::Rewind
+            && checkpoint.capability != RecoveryCapability::Rewindable
+        {
             self.status_message = Some("rewind is unavailable for this checkpoint".to_string());
             return;
         }
 
-        if kind == PendingActionKind::Restore && checkpoint.recovery == RecoveryBadge::Unavailable {
+        if kind == PendingActionKind::Restore
+            && checkpoint.capability == RecoveryCapability::Unavailable
+        {
             self.status_message = Some("restore is unavailable for this checkpoint".to_string());
             return;
         }
@@ -813,7 +774,6 @@ impl LogUiApp {
         self.modal = Some(PendingAction {
             kind,
             checkpoint_id: checkpoint.checkpoint.id.clone(),
-            fork_name: String::new(),
         });
     }
 
@@ -889,17 +849,19 @@ impl LogUiApp {
 struct TimelineSummary {
     timeline: TimelineRecord,
     run: RunRecord,
-    display_name: String,
-    runtime_label: String,
+    title: String,
+    runtime: String,
     checkpoints: Vec<CheckpointSummary>,
-    latest_checkpoint: Option<String>,
-    recovery: RecoveryBadge,
+    latest_action: String,
+    capability: RecoveryCapability,
 }
 
 #[derive(Clone)]
 struct CheckpointSummary {
     checkpoint: CheckpointRecord,
-    recovery: RecoveryBadge,
+    label: String,
+    preview: Option<String>,
+    capability: RecoveryCapability,
 }
 
 struct DiffPanel {
@@ -948,34 +910,30 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
         let checkpoints = timeline_checkpoints
             .into_iter()
             .map(|checkpoint| CheckpointSummary {
-                recovery: recovery_badge(&checkpoint),
+                label: tool_event_label(&checkpoint),
+                preview: tool_event_preview(&checkpoint),
+                capability: recovery_capability(&checkpoint),
                 checkpoint,
             })
             .collect::<Vec<_>>();
 
-        let latest_checkpoint = checkpoints
+        let latest_action = latest_action_label(checkpoints.first().map(|item| &item.checkpoint));
+        let capability = checkpoints
             .first()
-            .map(|item| format!("{} {}", item.checkpoint.id, item.checkpoint.reason));
-        let recovery = checkpoints
-            .first()
-            .map(|item| item.recovery)
-            .unwrap_or(RecoveryBadge::Unavailable);
-
-        let display_name = timeline
-            .name
-            .clone()
-            .map(|name| format!("{name} ({})", timeline.id))
-            .unwrap_or_else(|| timeline.id.clone());
-        let runtime_label = runtime_label(&run);
+            .map(|item| item.capability)
+            .unwrap_or(RecoveryCapability::Unavailable);
+        let title = session_title(&timeline, &run);
+        let end_timestamp = checkpoints.first().map(|item| item.checkpoint.created_at);
+        let runtime = format_runtime(timeline.created_at, end_timestamp);
 
         items.push(TimelineSummary {
             timeline,
             run,
-            display_name,
-            runtime_label,
+            title,
+            runtime,
             checkpoints,
-            latest_checkpoint,
-            recovery,
+            latest_action,
+            capability,
         });
     }
 
@@ -990,19 +948,16 @@ fn build_diff_panel(
     let (compare_label, patch) = match compare_mode {
         DiffCompareMode::Parent => match checkpoint.checkpoint.parent_checkpoint_id.as_deref() {
             Some(parent_id) => (
-                format!(
-                    "compare: parent {parent_id} -> {}",
-                    checkpoint.checkpoint.id
-                ),
+                "Compared with previous protected action".to_string(),
                 store.diff(parent_id, &checkpoint.checkpoint.id)?,
             ),
             None => (
-                format!("compare: workspace now -> {}", checkpoint.checkpoint.id),
+                "Compared with current workspace".to_string(),
                 store.diff_workspace(&checkpoint.checkpoint.id)?,
             ),
         },
         DiffCompareMode::Workspace => (
-            format!("compare: workspace now -> {}", checkpoint.checkpoint.id),
+            "Compared with current workspace".to_string(),
             store.diff_workspace(&checkpoint.checkpoint.id)?,
         ),
     };
@@ -1086,72 +1041,77 @@ fn summarize_diff(lines: &[String]) -> String {
     }
 }
 
-fn timeline_row(timeline: &TimelineSummary) -> Line<'static> {
-    let latest = timeline
-        .latest_checkpoint
-        .as_deref()
-        .unwrap_or("no checkpoints yet")
-        .to_string();
-    Line::from(vec![
-        Span::styled(
-            format!("{:<24}", truncate(&timeline.display_name, 24)),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{:<8}", timeline.runtime_label),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            format!("{:<10}", timeline.run.status.as_str()),
-            status_style(&timeline.run),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{:<13}", recovery_label(timeline.recovery)),
-            recovery_style(timeline.recovery),
-        ),
-        Span::raw("  "),
-        Span::raw(format!("{:>2} cps  ", timeline.checkpoints.len())),
-        Span::raw(format!(
-            "{:<10}",
-            format_timestamp(timeline.timeline.created_at)
-        )),
-        Span::raw("  "),
-        Span::raw(truncate(&latest, 44)),
+fn timeline_row(timeline: &TimelineSummary, width: usize) -> Text<'static> {
+    let status = session_status_label(&timeline.run.status);
+    let capability = timeline.capability.label();
+    let started = format_absolute_time(timeline.timeline.created_at);
+    let checkpoint_count = format!("{} protected actions", timeline.checkpoints.len());
+    let title_width = line_budget(width, text_width(status) + text_width(capability) + 4, 24);
+    let latest_action_width = line_budget(
+        width,
+        text_width(&started) + text_width(&checkpoint_count) + 10,
+        24,
+    );
+
+    Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                truncate(&timeline.title, title_width),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(status, status_style(&timeline.run)),
+            Span::raw("  "),
+            Span::styled(capability, recovery_style(timeline.capability)),
+        ]),
+        Line::from(vec![
+            Span::styled(started, Style::default().fg(Color::DarkGray)),
+            Span::raw("  |  "),
+            Span::raw(checkpoint_count),
+            Span::raw("  |  "),
+            Span::raw(truncate(&timeline.latest_action, latest_action_width)),
+        ]),
     ])
 }
 
-fn checkpoint_row(checkpoint: &CheckpointSummary) -> Line<'static> {
-    let trigger = checkpoint
-        .checkpoint
-        .trigger_command
-        .as_deref()
-        .unwrap_or("no trigger command")
-        .to_string();
-    Line::from(vec![
-        Span::styled(
-            format!("{:<14}", checkpoint.checkpoint.id),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{:<16}", truncate(&checkpoint.checkpoint.reason, 16)),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::styled(
-            format!("{:<13}", recovery_label(checkpoint.recovery)),
-            recovery_style(checkpoint.recovery),
-        ),
-        Span::raw("  "),
-        Span::raw(format!(
-            "{:<10}",
-            format_timestamp(checkpoint.checkpoint.created_at)
-        )),
-        Span::raw("  "),
-        Span::raw(truncate(&trigger, 58)),
+fn checkpoint_row(checkpoint: &CheckpointSummary, width: usize) -> Text<'static> {
+    let preview = checkpoint
+        .preview
+        .clone()
+        .unwrap_or_else(|| "Protected action metadata unavailable.".to_string());
+    let capability = checkpoint.capability.label();
+    let relative_time = format_relative_time(checkpoint.checkpoint.created_at);
+    let absolute_time = format_absolute_time(checkpoint.checkpoint.created_at);
+    let label_width = line_budget(
+        width,
+        text_width(capability) + text_width(&relative_time) + 4,
+        24,
+    );
+    let preview_width = line_budget(width, text_width(&absolute_time) + 5, 24);
+
+    Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                truncate(&checkpoint.label, label_width),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(capability, recovery_style(checkpoint.capability)),
+            Span::raw("  "),
+            Span::styled(relative_time, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                truncate(&preview, preview_width),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::raw("  |  "),
+            Span::raw(absolute_time),
+        ]),
     ])
 }
 
@@ -1182,79 +1142,31 @@ fn footer_paragraph<'a>(
 }
 
 fn status_style(run: &RunRecord) -> Style {
-    match run.status.as_str() {
-        "running" => Style::default()
+    match run.status {
+        crate::model::RunStatus::Running => Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
-        "succeeded" => Style::default()
+        crate::model::RunStatus::Succeeded => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        "failed" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "forked" => Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
+        crate::model::RunStatus::Failed => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
         _ => Style::default().fg(Color::White),
     }
 }
 
-fn recovery_style(recovery: RecoveryBadge) -> Style {
+fn recovery_style(recovery: RecoveryCapability) -> Style {
     match recovery {
-        RecoveryBadge::Rewind => Style::default()
+        RecoveryCapability::Rewindable => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
-        RecoveryBadge::RestoreOnly => Style::default()
+        RecoveryCapability::RestoreOnly => Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
-        RecoveryBadge::Unavailable => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-    }
-}
-
-fn recovery_label(recovery: RecoveryBadge) -> &'static str {
-    match recovery {
-        RecoveryBadge::Rewind => "rewind",
-        RecoveryBadge::RestoreOnly => "restore-only",
-        RecoveryBadge::Unavailable => "unavailable",
-    }
-}
-
-fn recovery_badge(checkpoint: &CheckpointRecord) -> RecoveryBadge {
-    match (
-        checkpoint.runtime_name.as_deref(),
-        checkpoint.resumability.as_str(),
-    ) {
-        (_, "unavailable") => RecoveryBadge::Unavailable,
-        (Some("claude"), "partial") => RecoveryBadge::RestoreOnly,
-        (_, "full") | (_, "partial") => RecoveryBadge::Rewind,
-        _ => RecoveryBadge::Unavailable,
-    }
-}
-
-fn runtime_label(run: &RunRecord) -> String {
-    SupportedRuntime::detect(&run.command)
-        .map(|runtime| runtime.as_str().to_string())
-        .unwrap_or_else(|_| {
-            run.command
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string())
-        })
-}
-
-fn format_timestamp(timestamp: u64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let delta = now.saturating_sub(timestamp);
-
-    if delta < 60 {
-        format!("{delta}s ago")
-    } else if delta < 3600 {
-        format!("{}m ago", delta / 60)
-    } else if delta < 86_400 {
-        format!("{}h ago", delta / 3600)
-    } else {
-        format!("{}d ago", delta / 86_400)
+        RecoveryCapability::Unavailable => {
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }
     }
 }
 
@@ -1269,6 +1181,25 @@ fn truncate(value: &str, max_len: usize) -> String {
         .collect::<String>();
     output.push('…');
     output
+}
+
+fn list_row_width(area: Rect, highlight_symbol: &str) -> usize {
+    usize::from(area.width.saturating_sub(2))
+        .saturating_sub(text_width(highlight_symbol))
+        .saturating_sub(1)
+}
+
+fn line_budget(total_width: usize, fixed_width: usize, min_width: usize) -> usize {
+    if total_width == 0 {
+        return 0;
+    }
+
+    let minimum = min_width.min(total_width);
+    total_width.saturating_sub(fixed_width).max(minimum)
+}
+
+fn text_width(value: &str) -> usize {
+    value.chars().count()
 }
 
 fn style_diff_line(line: &str) -> Span<'static> {
@@ -1293,8 +1224,7 @@ fn style_diff_line(line: &str) -> Span<'static> {
 fn pending_action_title(kind: PendingActionKind) -> &'static str {
     match kind {
         PendingActionKind::Restore => "Restore workspace",
-        PendingActionKind::Rewind => "Rewind from checkpoint",
-        PendingActionKind::Fork => "Fork timeline",
+        PendingActionKind::Rewind => "Rewind from action",
     }
 }
 
@@ -1337,15 +1267,6 @@ fn centered_rect(horizontal: u16, vertical: u16, area: Rect) -> Rect {
         .split(vertical_layout[1])[1]
 }
 
-fn trimmed_name(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 fn select_by_id<T, F>(state: &mut ListState, items: &[T], selected_id: Option<&str>, id_fn: F)
 where
     F: Fn(&T) -> &str,
@@ -1358,8 +1279,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{RecoveryBadge, parse_diff_files, recovery_badge};
+    use super::{line_budget, parse_diff_files};
     use crate::model::{CheckpointRecord, Resumability, RuntimeFingerprint};
+    use crate::presentation::{RecoveryCapability, recovery_capability};
 
     #[test]
     fn parse_diff_files_extracts_per_file_sections() {
@@ -1385,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_badge_treats_partial_claude_checkpoints_as_restore_only() {
+    fn recovery_capability_treats_partial_claude_checkpoints_as_restore_only() {
         let checkpoint = CheckpointRecord {
             id: "cp_test".to_string(),
             timeline_id: "tl_test".to_string(),
@@ -1411,6 +1333,19 @@ mod tests {
             },
         };
 
-        assert_eq!(recovery_badge(&checkpoint), RecoveryBadge::RestoreOnly);
+        assert_eq!(
+            recovery_capability(&checkpoint),
+            RecoveryCapability::RestoreOnly
+        );
+    }
+
+    #[test]
+    fn line_budget_expands_when_space_is_available() {
+        assert_eq!(line_budget(80, 20, 24), 60);
+    }
+
+    #[test]
+    fn line_budget_preserves_a_minimum_budget_when_space_is_tight() {
+        assert_eq!(line_budget(30, 20, 24), 24);
     }
 }
