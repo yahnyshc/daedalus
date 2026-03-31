@@ -442,13 +442,35 @@ impl DaedalusStore {
         let path_a = self.snapshot_path(&a.snapshot_rel_path);
         let path_b = self.snapshot_path(&b.snapshot_rel_path);
 
+        self.diff_paths(&path_a, &path_b)
+    }
+
+    pub fn diff_workspace(&self, checkpoint_id: &str) -> Result<String> {
+        self.ensure_initialized()?;
+        let checkpoint = self.read_checkpoint(checkpoint_id)?;
+        let snapshot_path = self.snapshot_path(&checkpoint.snapshot_rel_path);
+        let temp_root = self
+            .state_dir
+            .join("tmp")
+            .join(format!("diff-workspace-{checkpoint_id}"));
+        if temp_root.exists() {
+            fs::remove_dir_all(&temp_root)?;
+        }
+        fs::create_dir_all(&temp_root)?;
+        copy_workspace_to_snapshot(&self.repo_root, &temp_root)?;
+        let output = self.diff_paths(&snapshot_path, &temp_root);
+        fs::remove_dir_all(&temp_root)?;
+        output
+    }
+
+    fn diff_paths(&self, path_a: &Path, path_b: &Path) -> Result<String> {
         let output = Command::new("git")
             .arg("--no-pager")
             .arg("diff")
             .arg("--no-index")
             .arg("--")
-            .arg(&path_a)
-            .arg(&path_b)
+            .arg(path_a)
+            .arg(path_b)
             .output()?;
 
         match output.status.code() {

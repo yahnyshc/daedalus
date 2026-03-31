@@ -1,8 +1,10 @@
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::io::Read;
 
 use crate::error::{DdlError, Result};
+use crate::log_ui::{LogUiExit, run_log_ui};
 use crate::model::Resumability;
 use crate::store::DaedalusStore;
 
@@ -51,8 +53,15 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         }
         CommandLine::Log => {
             let store = DaedalusStore::discover()?;
-            print_log(&store)?;
-            Ok(0)
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                match run_log_ui(&store)? {
+                    LogUiExit::Quit => Ok(0),
+                    LogUiExit::Rewind(checkpoint_id) => store.rewind(&checkpoint_id),
+                }
+            } else {
+                print_log(&store)?;
+                Ok(0)
+            }
         }
         CommandLine::Diff {
             checkpoint_a,

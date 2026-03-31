@@ -101,7 +101,7 @@ Command intent:
 - `ddl init`: initialize `daedalus` state for the repo
 - `ddl run`: execute a supported agent runtime under protection
 - `ddl shell`: execute a shell command through `daedalus`' checkpoint matcher
-- `ddl log`: inspect execution timelines and checkpoints
+- `ddl log`: inspect recent execution timelines in an interactive recovery console when attached to a TTY, or emit plain text in non-interactive contexts
 - `ddl diff`: inspect file and metadata differences between checkpoints
 - `ddl restore`: return workspace and checkpoint metadata to a known point without launching the agent
 - `ddl rewind`: restore workspace and, when available, continue the same timeline from a checkpoint with saved agent context
@@ -260,6 +260,8 @@ Near-term extensions after the core demo:
 ## Status
 
 This repo now includes a working shell-first v1 implementation. It keeps the repo-local state model and shadow git-backed checkpoint storage from the scaffold, but moves automatic checkpointing to wrapped mutation boundaries instead of creating checkpoints at run start. Claude Code sessions now also checkpoint before supported edit and Bash tools through an injected `PreToolUse` hook.
+
+`ddl log` is now TTY-aware: in an interactive terminal it becomes a recovery console with recent timelines, checkpoint drilldown, diff inspection, and direct restore/rewind/fork actions. In non-interactive contexts it keeps the plain text log output.
 
 The implementation should stay anchored to the same promise:
 

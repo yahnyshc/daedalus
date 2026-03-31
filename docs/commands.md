@@ -7,8 +7,10 @@ Internally, rule matching now flows through a shared tool invocation model so fu
 - `ddl run -- <agent command>` supports `codex` and `claude`, launches them from the repo root, and prepares runtime-specific protection:
   Claude gets a session-scoped `PreToolUse` hook for `Edit|MultiEdit|Write|Bash`, while Codex keeps the checkpointed Bash shell path.
 - `ddl shell -- <command>` executes a shell command through the same matcher and checkpoint path used by wrapped runtimes.
-- `ddl log` lists timelines and checkpoints, including shell-triggered checkpoint reasons and triggering commands when present.
-- `ddl log` also reports restore availability separately from rewind availability, so users can choose repo-only recovery or agent-context recovery explicitly.
+- `ddl log` is TTY-aware:
+  in an interactive terminal it opens a recovery console with recent timelines, timeline drilldown, diff inspection, and recovery actions.
+  In non-interactive contexts it keeps the plain text log output for scripts and pipes.
+- `ddl log` reports restore availability separately from rewind availability, so users can choose repo-only recovery or agent-context recovery explicitly.
 - `ddl diff` compares checkpoint snapshots with `git diff --no-index`.
 - `ddl restore` copies a checkpoint snapshot back into the workspace.
 - `ddl rewind` restores a checkpoint and rewinds the owned runtime on the same timeline.

@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod ids;
 mod kv;
+mod log_ui;
 mod model;
 mod runtime;
 mod store;
