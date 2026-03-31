@@ -1,6 +1,7 @@
 # Command Semantics
 
-The current implementation is shell-first and uses checkpointing at wrapped mutation boundaries:
+The current implementation is shell-first and uses checkpointing at wrapped mutation boundaries.
+Internally, rule matching now flows through a shared tool invocation model so future tool adapters can reuse the same matcher and checkpoint recorder:
 
 - `ddl init` creates repo-local state, initializes the shadow git repository, and writes `.daedalus/config.json`.
 - `ddl run -- <agent command>` supports `codex` and `claude`, launches them from the repo root, and prepares a shell wrapper environment for checkpointed Bash execution.
@@ -14,7 +15,7 @@ The current implementation is shell-first and uses checkpointing at wrapped muta
 Current v1 limits:
 
 - only `Bash(...)` rules are enforced
-- `Edit(*)` and `Write(*)` are accepted in config but not enforced yet
+- `Edit(*)` and `Write(*)` are accepted in config and match the shared internal model, but they remain unenforced until a runtime emits those tool invocations
 - unsupported runtimes fail clearly instead of running partially protected
 - transcript capture is still metadata-ready, not deeply integrated
 - symlink snapshots are rejected for now

@@ -130,10 +130,11 @@ Manual checkpoint commands are deliberately not in the first public story. The c
 
 v1 rule behavior is intentionally small:
 
+- checkpoint matching uses a shared internal tool invocation model, but the public behavior is still Bash-first
 - `Bash(prefix:*)` uses deterministic argv-prefix matching
 - `Bash(command)` uses exact argv matching
 - `:*` means any trailing args
-- `Edit(*)` and `Write(*)` are accepted by the parser but not enforced yet
+- `Edit(*)` and `Write(*)` are accepted by the parser and shared matcher, but not enforced until a runtime emits those invocations
 
 Older repos that only have the legacy `.daedalus/config` file must be re-initialized or migrated. `daedalus` now fails clearly instead of silently skipping rule enforcement.
 
@@ -268,5 +269,6 @@ The current base provides:
 The current enforcement surface is intentionally narrow:
 
 - `Bash(...)` rules are enforced now
-- `Edit(*)` and `Write(*)` are accepted in config for forward compatibility but not enforced yet
+- checkpoint matching is routed through a shared internal tool invocation pipeline
+- `Edit(*)` and `Write(*)` are accepted in config for forward compatibility but not enforced until a runtime emits them
 - unsupported runtimes fail clearly instead of pretending they are protected

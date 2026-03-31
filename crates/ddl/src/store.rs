@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, NormalizedCommand};
+use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, ToolInvocation};
 use crate::error::{DdlError, Result};
 use crate::ids::next_id;
 use crate::model::{
@@ -203,21 +203,28 @@ impl DaedalusStore {
 
         let config = self.load_config()?;
         let real_shell = env::var(ENV_REAL_SHELL).ok();
-        let normalized = match real_shell.as_deref() {
-            Some(_) => NormalizedCommand::from_shell_args(&command),
-            None => NormalizedCommand::from_argv(command.clone()),
+        let invocation = match real_shell.as_deref() {
+            Some(_) => ToolInvocation::from_shell_args(&command),
+            None => ToolInvocation::from_shell_command(command.clone()),
         };
 
         let mut standalone = None;
-        if config.matching_bash_rule(&normalized.argv).is_some() {
+        if config.matching_rule(&invocation).is_some() {
             standalone = match current_shell_context() {
                 Some(context) => {
-                    self.record_shell_checkpoint(&context, &normalized)?;
+                    let invocation = invocation
+                        .clone()
+                        .with_runtime_name(context.runtime.as_str());
+                    self.record_tool_checkpoint(
+                        &context.timeline_id,
+                        &context.run_id,
+                        &invocation,
+                    )?;
                     None
                 }
                 None => {
                     let run = self.create_standalone_shell_run(&command)?;
-                    self.record_standalone_shell_checkpoint(&run, &normalized)?;
+                    self.record_tool_checkpoint(&run.timeline_id, &run.run_id, &invocation)?;
                     Some(run)
                 }
             };
@@ -481,59 +488,29 @@ impl DaedalusStore {
         })
     }
 
-    fn record_shell_checkpoint(
+    fn record_tool_checkpoint(
         &self,
-        context: &ShellWrapperContext,
-        normalized: &NormalizedCommand,
+        timeline_id: &str,
+        run_id: &str,
+        invocation: &ToolInvocation,
     ) -> Result<CheckpointRecord> {
-        let mut run = self.read_run(&context.run_id)?;
-        let mut timeline = self.read_timeline(&context.timeline_id)?;
+        let mut run = self.read_run(run_id)?;
+        let mut timeline = self.read_timeline(timeline_id)?;
 
         let checkpoint = self.create_checkpoint_internal(
-            &timeline.id,
-            &run.id,
+            timeline_id,
+            run_id,
             run.last_checkpoint_id.clone(),
-            "before-shell".to_string(),
+            invocation.reason().to_string(),
             CheckpointTriggerMetadata {
-                tool_type: Some("bash".to_string()),
-                command: Some(normalized.command_string.clone()),
-                runtime_name: Some(context.runtime.as_str().to_string()),
+                tool_type: Some(invocation.tool.to_string()),
+                command: Some(invocation.display.clone()),
+                runtime_name: invocation.runtime_name.clone(),
             },
         )?;
 
         run.last_checkpoint_id = Some(checkpoint.id.clone());
         self.write_run(&run)?;
-
-        if timeline.root_checkpoint_id.is_none() {
-            timeline.root_checkpoint_id = Some(checkpoint.id.clone());
-            self.write_timeline(&timeline)?;
-        }
-
-        Ok(checkpoint)
-    }
-
-    fn record_standalone_shell_checkpoint(
-        &self,
-        run: &StandaloneShellRun,
-        normalized: &NormalizedCommand,
-    ) -> Result<CheckpointRecord> {
-        let mut run_record = self.read_run(&run.run_id)?;
-        let mut timeline = self.read_timeline(&run.timeline_id)?;
-
-        let checkpoint = self.create_checkpoint_internal(
-            &run.timeline_id,
-            &run.run_id,
-            run_record.last_checkpoint_id.clone(),
-            "before-shell".to_string(),
-            CheckpointTriggerMetadata {
-                tool_type: Some("bash".to_string()),
-                command: Some(normalized.command_string.clone()),
-                runtime_name: None,
-            },
-        )?;
-
-        run_record.last_checkpoint_id = Some(checkpoint.id.clone());
-        self.write_run(&run_record)?;
 
         if timeline.root_checkpoint_id.is_none() {
             timeline.root_checkpoint_id = Some(checkpoint.id.clone());
@@ -957,8 +934,13 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert!(!repo_root.join("test.txt").exists());
 
+        let timelines = store.list_timelines().expect("list timelines");
+        assert_eq!(timelines.len(), 1);
+        assert_eq!(timelines[0].name.as_deref(), Some("shell"));
+
         let checkpoints = store.list_checkpoints().expect("list checkpoints");
         assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].timeline_id, timelines[0].id);
         assert_eq!(checkpoints[0].reason, "before-shell");
         assert_eq!(
             checkpoints[0].trigger_command.as_deref(),
@@ -985,6 +967,7 @@ mod tests {
         std::env::set_current_dir(previous).expect("restore cwd");
 
         assert_eq!(exit_code, 0);
+        assert!(store.list_timelines().expect("list timelines").is_empty());
         assert!(
             store
                 .list_checkpoints()
@@ -1051,6 +1034,7 @@ mod tests {
         assert_eq!(exit_code, 0);
         let checkpoints = store.list_checkpoints().expect("list checkpoints");
         assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].timeline_id, timeline_id);
         assert_eq!(checkpoints[0].runtime_name.as_deref(), Some("codex"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");

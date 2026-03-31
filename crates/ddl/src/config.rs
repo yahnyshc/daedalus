@@ -48,11 +48,11 @@ impl DaedalusConfig {
         })
     }
 
-    pub fn matching_bash_rule(&self, command: &[String]) -> Option<&CheckpointRule> {
+    pub fn matching_rule(&self, invocation: &ToolInvocation) -> Option<&CheckpointRule> {
         self.checkpointing
             .before
             .iter()
-            .find(|rule| rule.matches_bash(command))
+            .find(|rule| rule.matches_invocation(invocation))
     }
 }
 
@@ -91,8 +91,8 @@ impl CheckpointRule {
         })
     }
 
-    pub fn matches_bash(&self, command: &[String]) -> bool {
-        matches!(self.tool, ToolKind::Bash) && self.matcher.matches(command)
+    pub fn matches_invocation(&self, invocation: &ToolInvocation) -> bool {
+        self.tool == invocation.tool && self.matcher.matches_invocation(invocation)
     }
 }
 
@@ -124,6 +124,75 @@ impl Display for ToolKind {
             Self::Write => write!(f, "write"),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolInvocation {
+    pub tool: ToolKind,
+    pub display: String,
+    pub runtime_name: Option<String>,
+    pub payload: ToolPayload,
+}
+
+impl ToolInvocation {
+    pub fn from_shell_command(argv: Vec<String>) -> Self {
+        let display = argv.join(" ");
+        Self {
+            tool: ToolKind::Bash,
+            display,
+            runtime_name: None,
+            payload: ToolPayload::Bash { argv },
+        }
+    }
+
+    pub fn from_shell_args(shell_argv: &[String]) -> Self {
+        if let Some(script) = extract_shell_script(shell_argv) {
+            match split_command_words(&script) {
+                Ok(argv) if !argv.is_empty() => Self {
+                    display: argv.join(" "),
+                    payload: ToolPayload::Bash { argv },
+                    ..Self::bash_base(None)
+                },
+                _ => Self {
+                    display: script.clone(),
+                    payload: ToolPayload::Bash { argv: vec![script] },
+                    ..Self::bash_base(None)
+                },
+            }
+        } else {
+            Self::from_shell_command(shell_argv.to_vec())
+        }
+    }
+
+    pub fn with_runtime_name(mut self, runtime_name: impl Into<String>) -> Self {
+        self.runtime_name = Some(runtime_name.into());
+        self
+    }
+
+    pub fn reason(&self) -> &'static str {
+        match self.tool {
+            ToolKind::Bash => "before-shell",
+            ToolKind::Edit => "before-edit",
+            ToolKind::Write => "before-write",
+        }
+    }
+
+    fn bash_base(runtime_name: Option<String>) -> Self {
+        Self {
+            tool: ToolKind::Bash,
+            display: String::new(),
+            runtime_name,
+            payload: ToolPayload::Bash { argv: Vec::new() },
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ToolPayload {
+    Bash { argv: Vec<String> },
+    Edit { path: String },
+    Write { path: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,7 +246,16 @@ impl RuleMatcher {
         }
     }
 
-    fn matches(&self, command: &[String]) -> bool {
+    fn matches_invocation(&self, invocation: &ToolInvocation) -> bool {
+        match &invocation.payload {
+            ToolPayload::Bash { argv } => self.matches_argv(argv),
+            ToolPayload::Edit { .. } | ToolPayload::Write { .. } => {
+                self.argv_prefix.is_empty() && self.allow_trailing
+            }
+        }
+    }
+
+    fn matches_argv(&self, command: &[String]) -> bool {
         if self.argv_prefix.is_empty() {
             return self.allow_trailing;
         }
@@ -188,39 +266,6 @@ impl RuleMatcher {
             return false;
         }
         self.allow_trailing || command.len() == self.argv_prefix.len()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NormalizedCommand {
-    pub argv: Vec<String>,
-    pub command_string: String,
-}
-
-impl NormalizedCommand {
-    pub fn from_argv(argv: Vec<String>) -> Self {
-        let command_string = argv.join(" ");
-        Self {
-            argv,
-            command_string,
-        }
-    }
-
-    pub fn from_shell_args(shell_argv: &[String]) -> Self {
-        if let Some(script) = extract_shell_script(shell_argv) {
-            match split_command_words(&script) {
-                Ok(argv) if !argv.is_empty() => Self {
-                    command_string: argv.join(" "),
-                    argv,
-                },
-                _ => Self {
-                    argv: vec![script.clone()],
-                    command_string: script,
-                },
-            }
-        } else {
-            Self::from_argv(shell_argv.to_vec())
-        }
     }
 }
 
@@ -558,7 +603,9 @@ fn expect_string(value: JsonValue, context: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointRule, DEFAULT_CONFIG_JSON, DaedalusConfig, NormalizedCommand, ToolKind};
+    use super::{
+        CheckpointRule, DEFAULT_CONFIG_JSON, DaedalusConfig, ToolInvocation, ToolKind, ToolPayload,
+    };
 
     #[test]
     fn parses_default_json_config() {
@@ -591,31 +638,132 @@ mod tests {
 
         assert!(
             config
-                .matching_bash_rule(&vec!["npm".into(), "install".into(), "foo".into()])
+                .matching_rule(&ToolInvocation::from_shell_command(vec![
+                    "npm".into(),
+                    "install".into(),
+                    "foo".into(),
+                ]))
                 .is_some()
         );
         assert!(
             config
-                .matching_bash_rule(&vec!["git".into(), "rebase".into(), "main".into()])
+                .matching_rule(&ToolInvocation::from_shell_command(vec![
+                    "git".into(),
+                    "rebase".into(),
+                    "main".into(),
+                ]))
                 .is_some()
         );
         assert!(
             config
-                .matching_bash_rule(&vec!["rm".into(), "-rf".into(), "tmp".into()])
+                .matching_rule(&ToolInvocation::from_shell_command(vec![
+                    "rm".into(),
+                    "-rf".into(),
+                    "tmp".into(),
+                ]))
                 .is_some()
         );
         assert!(
             config
-                .matching_bash_rule(&vec!["ls".into(), "-la".into()])
+                .matching_rule(&ToolInvocation::from_shell_command(vec![
+                    "ls".into(),
+                    "-la".into(),
+                ]))
                 .is_none()
         );
     }
 
     #[test]
+    fn matches_exact_bash_command_only() {
+        let rule = CheckpointRule::parse("Bash(git status)").expect("parse exact rule");
+
+        assert!(
+            rule.matches_invocation(&ToolInvocation::from_shell_command(vec![
+                "git".into(),
+                "status".into(),
+            ]))
+        );
+        assert!(
+            !rule.matches_invocation(&ToolInvocation::from_shell_command(vec![
+                "git".into(),
+                "status".into(),
+                "--short".into(),
+            ]))
+        );
+    }
+
+    #[test]
+    fn bash_rule_does_not_match_edit_invocation() {
+        let rule = CheckpointRule::parse("Bash(rm:*)").expect("parse rule");
+        let invocation = ToolInvocation {
+            tool: ToolKind::Edit,
+            display: "test.txt".to_string(),
+            runtime_name: None,
+            payload: ToolPayload::Edit {
+                path: "test.txt".to_string(),
+            },
+        };
+
+        assert!(!rule.matches_invocation(&invocation));
+    }
+
+    #[test]
+    fn edit_and_write_wildcards_match_synthetic_invocations() {
+        let edit_rule = CheckpointRule::parse("Edit(*)").expect("parse edit rule");
+        let write_rule = CheckpointRule::parse("Write(*)").expect("parse write rule");
+
+        let edit = ToolInvocation {
+            tool: ToolKind::Edit,
+            display: "test.txt".to_string(),
+            runtime_name: None,
+            payload: ToolPayload::Edit {
+                path: "test.txt".to_string(),
+            },
+        };
+        let write = ToolInvocation {
+            tool: ToolKind::Write,
+            display: "test.txt".to_string(),
+            runtime_name: None,
+            payload: ToolPayload::Write {
+                path: "test.txt".to_string(),
+            },
+        };
+
+        assert!(edit_rule.matches_invocation(&edit));
+        assert!(write_rule.matches_invocation(&write));
+    }
+
+    #[test]
     fn normalizes_shell_script_commands() {
-        let normalized =
-            NormalizedCommand::from_shell_args(&["-lc".to_string(), "npm install foo".to_string()]);
-        assert_eq!(normalized.argv, vec!["npm", "install", "foo"]);
-        assert_eq!(normalized.command_string, "npm install foo");
+        let invocation =
+            ToolInvocation::from_shell_args(&["-lc".to_string(), "npm install foo".to_string()]);
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::Bash,
+                display: "npm install foo".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::Bash {
+                    argv: vec!["npm".into(), "install".into(), "foo".into()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_direct_shell_command_without_changes() {
+        let invocation =
+            ToolInvocation::from_shell_command(vec!["rm".to_string(), "test.txt".to_string()]);
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::Bash,
+                display: "rm test.txt".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::Bash {
+                    argv: vec!["rm".into(), "test.txt".into()],
+                },
+            }
+        );
     }
 }
