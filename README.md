@@ -118,6 +118,7 @@ Manual checkpoint commands are deliberately not in the first public story. The c
   "checkpointing": {
     "before": [
       "Edit(*)",
+      "MultiEdit(*)",
       "Write(*)",
       "Bash(npm install:*)",
       "Bash(git rebase:*)",
@@ -130,10 +131,12 @@ Manual checkpoint commands are deliberately not in the first public story. The c
 
 v1 rule behavior is intentionally small:
 
+- checkpoint matching uses a shared internal tool invocation model
 - `Bash(prefix:*)` uses deterministic argv-prefix matching
 - `Bash(command)` uses exact argv matching
 - `:*` means any trailing args
-- `Edit(*)` and `Write(*)` are accepted by the parser but not enforced yet
+- `Edit(*)`, `MultiEdit(*)`, `Write(*)`, and `Bash(...)` are enforced for Claude Code sessions launched through `ddl run -- claude ...`
+- Codex remains Bash-only in this increment
 
 Older repos that only have the legacy `.daedalus/config` file must be re-initialized or migrated. `daedalus` now fails clearly instead of silently skipping rule enforcement.
 
@@ -247,7 +250,7 @@ Near-term extensions after the core demo:
 
 ## Status
 
-This repo now includes a working shell-first v1 implementation. It keeps the repo-local state model and shadow git-backed checkpoint storage from the scaffold, but moves automatic checkpointing to wrapped mutation boundaries instead of creating checkpoints at run start.
+This repo now includes a working shell-first v1 implementation. It keeps the repo-local state model and shadow git-backed checkpoint storage from the scaffold, but moves automatic checkpointing to wrapped mutation boundaries instead of creating checkpoints at run start. Claude Code sessions now also checkpoint before supported edit and Bash tools through an injected `PreToolUse` hook.
 
 The implementation should stay anchored to the same promise:
 
@@ -264,9 +267,12 @@ The current base provides:
 - `ddl run` wrapper mode for `codex` and `claude`
 - `ddl shell` for direct shell execution through the matcher
 - automatic checkpointing for configured `Bash(...)` rules
+- Claude Code `PreToolUse` hook checkpointing for `Edit(*)`, `MultiEdit(*)`, `Write(*)`, and `Bash(...)`
 
 The current enforcement surface is intentionally narrow:
 
 - `Bash(...)` rules are enforced now
-- `Edit(*)` and `Write(*)` are accepted in config for forward compatibility but not enforced yet
+- checkpoint matching is routed through a shared internal tool invocation pipeline
+- Claude Code enforces `Edit(*)`, `MultiEdit(*)`, `Write(*)`, and `Bash(...)` through a session-scoped hook when launched via `ddl run`
+- Codex remains on the existing Bash-only path
 - unsupported runtimes fail clearly instead of pretending they are protected
