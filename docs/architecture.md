@@ -12,4 +12,4 @@ The current base is split into a few stable responsibilities:
 - runtime wrapper preparation for supported agent CLIs
 - a shadow git repository used to version checkpoint snapshots
 
-This base favors a narrow, credible v1 over premature abstraction. The first implementation keeps a single storage backend, a small command surface, and a shell-first runtime model while routing checkpoint matching through a shared internal tool invocation pipeline. Public enforcement is still Bash-only for now, and `Edit(*)` / `Write(*)` remain dormant until a runtime emits those invocations.
+This base favors a narrow, credible v1 over premature abstraction. The first implementation keeps a single storage backend, a small command surface, and a shell-first runtime model while routing checkpoint matching through a shared internal tool invocation pipeline. Claude Code now emits `Edit`, `MultiEdit`, `Write`, and `Bash` invocations through a supported `PreToolUse` hook, while Codex remains on the Bash-only path.

@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::io::Read;
 
 use crate::error::{DdlError, Result};
 use crate::store::DaedalusStore;
@@ -39,6 +40,12 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         CommandLine::Shell { command } => {
             let store = DaedalusStore::discover()?;
             store.run_shell_command(command)
+        }
+        CommandLine::ClaudePreToolUseHook => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let store = DaedalusStore::discover()?;
+            store.handle_claude_pre_tool_use(&input)
         }
         CommandLine::Log => {
             let store = DaedalusStore::discover()?;
@@ -87,6 +94,7 @@ enum CommandLine {
     Shell {
         command: Vec<String>,
     },
+    ClaudePreToolUseHook,
     Log,
     Diff {
         checkpoint_a: Option<String>,
@@ -118,6 +126,7 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         "-h" | "--help" | "help" => Ok(CommandLine::Help),
         "init" => Ok(CommandLine::Init),
         "log" => Ok(CommandLine::Log),
+        "internal" => parse_internal(parts),
         "run" => parse_run(parts),
         "shell" => parse_shell(parts),
         "diff" => parse_diff(parts),
@@ -140,6 +149,18 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
         other => Err(DdlError::InvalidInput(format!(
             "unknown command `{other}`; run `ddl --help` for usage"
         ))),
+    }
+}
+
+fn parse_internal(parts: Vec<String>) -> Result<CommandLine> {
+    match parts.get(2).map(String::as_str) {
+        Some("claude-pre-tool-use") => Ok(CommandLine::ClaudePreToolUseHook),
+        Some(other) => Err(DdlError::InvalidInput(format!(
+            "unknown internal command `{other}`"
+        ))),
+        None => Err(DdlError::InvalidInput(
+            "missing internal command".to_string(),
+        )),
     }
 }
 

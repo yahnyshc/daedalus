@@ -8,6 +8,7 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
   "checkpointing": {
     "before": [
       "Edit(*)",
+      "MultiEdit(*)",
       "Write(*)",
       "Bash(npm install:*)",
       "Bash(git rebase:*)",
@@ -100,6 +101,7 @@ impl CheckpointRule {
 pub enum ToolKind {
     Bash,
     Edit,
+    MultiEdit,
     Write,
 }
 
@@ -108,9 +110,10 @@ impl ToolKind {
         match value {
             "Bash" => Ok(Self::Bash),
             "Edit" => Ok(Self::Edit),
+            "MultiEdit" => Ok(Self::MultiEdit),
             "Write" => Ok(Self::Write),
             _ => Err(DdlError::InvalidConfig(format!(
-                "invalid checkpoint rule tool `{value}`; expected Bash, Edit, or Write"
+                "invalid checkpoint rule tool `{value}`; expected Bash, Edit, MultiEdit, or Write"
             ))),
         }
     }
@@ -121,6 +124,7 @@ impl Display for ToolKind {
         match self {
             Self::Bash => write!(f, "bash"),
             Self::Edit => write!(f, "edit"),
+            Self::MultiEdit => write!(f, "multiedit"),
             Self::Write => write!(f, "write"),
         }
     }
@@ -164,6 +168,71 @@ impl ToolInvocation {
         }
     }
 
+    pub fn from_claude_pre_tool_use(raw: &str) -> Result<Option<Self>> {
+        let value = JsonParser::new(raw).parse().map_err(|error| {
+            DdlError::InvalidInput(format!("invalid Claude hook payload: {error}"))
+        })?;
+        let root = expect_object_input(value, "Claude hook payload")?;
+        let tool_name = required_string_input(&root, "tool_name", "Claude hook payload")?;
+        let tool_input = required_object_input(&root, "tool_input", "Claude hook payload")?;
+
+        let invocation = match tool_name.as_str() {
+            "Bash" => {
+                let command =
+                    optional_string_input(&tool_input, "command", "Claude hook tool input")?;
+                if command.is_none()
+                    && optional_bool_input(&tool_input, "restart", "Claude hook tool input")?
+                        .unwrap_or(false)
+                {
+                    return Ok(None);
+                }
+
+                let command = command.ok_or_else(|| {
+                    DdlError::InvalidInput(
+                        "invalid Claude hook payload: missing `command` in Claude hook tool input"
+                            .to_string(),
+                    )
+                })?;
+                Self::from_bash_command_string(command)
+            }
+            "Edit" => {
+                let path =
+                    required_string_input(&tool_input, "file_path", "Claude hook tool input")?;
+                Self {
+                    tool: ToolKind::Edit,
+                    display: path.clone(),
+                    runtime_name: None,
+                    payload: ToolPayload::Edit { path },
+                }
+            }
+            "Write" => {
+                let path =
+                    required_string_input(&tool_input, "file_path", "Claude hook tool input")?;
+                Self {
+                    tool: ToolKind::Write,
+                    display: path.clone(),
+                    runtime_name: None,
+                    payload: ToolPayload::Write { path },
+                }
+            }
+            "MultiEdit" => {
+                let path =
+                    required_string_input(&tool_input, "file_path", "Claude hook tool input")?;
+                let edits = required_array_input(&tool_input, "edits", "Claude hook tool input")?;
+                let edit_count = edits.len();
+                Self {
+                    tool: ToolKind::MultiEdit,
+                    display: format!("{path} ({edit_count} edits)"),
+                    runtime_name: None,
+                    payload: ToolPayload::MultiEdit { path, edit_count },
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(invocation))
+    }
+
     pub fn with_runtime_name(mut self, runtime_name: impl Into<String>) -> Self {
         self.runtime_name = Some(runtime_name.into());
         self
@@ -173,6 +242,7 @@ impl ToolInvocation {
         match self.tool {
             ToolKind::Bash => "before-shell",
             ToolKind::Edit => "before-edit",
+            ToolKind::MultiEdit => "before-multiedit",
             ToolKind::Write => "before-write",
         }
     }
@@ -185,6 +255,19 @@ impl ToolInvocation {
             payload: ToolPayload::Bash { argv: Vec::new() },
         }
     }
+
+    fn from_bash_command_string(command: String) -> Self {
+        let argv = match split_command_words(&command) {
+            Ok(argv) if !argv.is_empty() => argv,
+            _ => vec![command.clone()],
+        };
+        Self {
+            tool: ToolKind::Bash,
+            display: command,
+            runtime_name: None,
+            payload: ToolPayload::Bash { argv },
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -192,6 +275,7 @@ impl ToolInvocation {
 pub enum ToolPayload {
     Bash { argv: Vec<String> },
     Edit { path: String },
+    MultiEdit { path: String, edit_count: usize },
     Write { path: String },
 }
 
@@ -232,7 +316,7 @@ impl RuleMatcher {
                     allow_trailing,
                 })
             }
-            ToolKind::Edit | ToolKind::Write => {
+            ToolKind::Edit | ToolKind::MultiEdit | ToolKind::Write => {
                 if pattern != "*" {
                     return Err(DdlError::InvalidConfig(format!(
                         "invalid checkpoint rule `{raw_rule}`: only `*` is accepted for {tool:?} in v1"
@@ -249,9 +333,9 @@ impl RuleMatcher {
     fn matches_invocation(&self, invocation: &ToolInvocation) -> bool {
         match &invocation.payload {
             ToolPayload::Bash { argv } => self.matches_argv(argv),
-            ToolPayload::Edit { .. } | ToolPayload::Write { .. } => {
-                self.argv_prefix.is_empty() && self.allow_trailing
-            }
+            ToolPayload::Edit { .. }
+            | ToolPayload::MultiEdit { .. }
+            | ToolPayload::Write { .. } => self.argv_prefix.is_empty() && self.allow_trailing,
         }
     }
 
@@ -601,6 +685,81 @@ fn expect_string(value: JsonValue, context: &str) -> Result<String> {
     }
 }
 
+fn expect_object_input(value: JsonValue, context: &str) -> Result<BTreeMap<String, JsonValue>> {
+    expect_object(value, context)
+        .map_err(|error| DdlError::InvalidInput(format!("invalid Claude hook payload: {error}")))
+}
+
+fn required_object_input(
+    map: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<BTreeMap<String, JsonValue>> {
+    let value = map.get(key).cloned().ok_or_else(|| {
+        DdlError::InvalidInput(format!(
+            "invalid Claude hook payload: missing `{key}` in {context}"
+        ))
+    })?;
+    expect_object_input(value, context)
+}
+
+fn required_array_input(
+    map: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Vec<JsonValue>> {
+    let value = map.get(key).cloned().ok_or_else(|| {
+        DdlError::InvalidInput(format!(
+            "invalid Claude hook payload: missing `{key}` in {context}"
+        ))
+    })?;
+    expect_array(value, context)
+        .map_err(|error| DdlError::InvalidInput(format!("invalid Claude hook payload: {error}")))
+}
+
+fn required_string_input(
+    map: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<String> {
+    let value = map.get(key).cloned().ok_or_else(|| {
+        DdlError::InvalidInput(format!(
+            "invalid Claude hook payload: missing `{key}` in {context}"
+        ))
+    })?;
+    expect_string(value, context)
+        .map_err(|error| DdlError::InvalidInput(format!("invalid Claude hook payload: {error}")))
+}
+
+fn optional_string_input(
+    map: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>> {
+    let Some(value) = map.get(key).cloned() else {
+        return Ok(None);
+    };
+    expect_string(value, context)
+        .map(Some)
+        .map_err(|error| DdlError::InvalidInput(format!("invalid Claude hook payload: {error}")))
+}
+
+fn optional_bool_input(
+    map: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<bool>> {
+    let Some(value) = map.get(key).cloned() else {
+        return Ok(None);
+    };
+    match value {
+        JsonValue::Bool(value) => Ok(Some(value)),
+        _ => Err(DdlError::InvalidInput(format!(
+            "invalid Claude hook payload: `{key}` in {context} must be a JSON boolean"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -610,9 +769,10 @@ mod tests {
     #[test]
     fn parses_default_json_config() {
         let config = DaedalusConfig::parse(DEFAULT_CONFIG_JSON).expect("parse config");
-        assert_eq!(config.checkpointing.before.len(), 6);
+        assert_eq!(config.checkpointing.before.len(), 7);
         assert_eq!(config.checkpointing.before[0].tool, ToolKind::Edit);
-        assert_eq!(config.checkpointing.before[2].tool, ToolKind::Bash);
+        assert_eq!(config.checkpointing.before[1].tool, ToolKind::MultiEdit);
+        assert_eq!(config.checkpointing.before[3].tool, ToolKind::Bash);
     }
 
     #[test]
@@ -710,6 +870,7 @@ mod tests {
     #[test]
     fn edit_and_write_wildcards_match_synthetic_invocations() {
         let edit_rule = CheckpointRule::parse("Edit(*)").expect("parse edit rule");
+        let multiedit_rule = CheckpointRule::parse("MultiEdit(*)").expect("parse multiedit rule");
         let write_rule = CheckpointRule::parse("Write(*)").expect("parse write rule");
 
         let edit = ToolInvocation {
@@ -728,9 +889,21 @@ mod tests {
                 path: "test.txt".to_string(),
             },
         };
+        let multiedit = ToolInvocation {
+            tool: ToolKind::MultiEdit,
+            display: "test.txt (2 edits)".to_string(),
+            runtime_name: None,
+            payload: ToolPayload::MultiEdit {
+                path: "test.txt".to_string(),
+                edit_count: 2,
+            },
+        };
 
         assert!(edit_rule.matches_invocation(&edit));
+        assert!(multiedit_rule.matches_invocation(&multiedit));
         assert!(write_rule.matches_invocation(&write));
+        assert!(!edit_rule.matches_invocation(&multiedit));
+        assert!(!write_rule.matches_invocation(&multiedit));
     }
 
     #[test]
@@ -765,5 +938,110 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn normalizes_claude_edit_hook_payload() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"src/main.rs"}}"#,
+        )
+        .expect("parse hook payload")
+        .expect("supported tool");
+
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::Edit,
+                display: "src/main.rs".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::Edit {
+                    path: "src/main.rs".to_string(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_claude_bash_hook_payload() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"Bash","tool_input":{"command":"rm /tmp/test.txt"}}"#,
+        )
+        .expect("parse hook payload")
+        .expect("supported tool");
+
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::Bash,
+                display: "rm /tmp/test.txt".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::Bash {
+                    argv: vec!["rm".into(), "/tmp/test.txt".into()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn normalizes_claude_multiedit_hook_payload() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"MultiEdit","tool_input":{"file_path":"src/main.rs","edits":[{"old_string":"a","new_string":"b"},{"old_string":"c","new_string":"d"}]}}"#,
+        )
+        .expect("parse hook payload")
+        .expect("supported tool");
+
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::MultiEdit,
+                display: "src/main.rs (2 edits)".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::MultiEdit {
+                    path: "src/main.rs".to_string(),
+                    edit_count: 2,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_claude_bash_restart_payloads_without_command() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"Bash","tool_input":{"restart":true}}"#,
+        )
+        .expect("parse hook payload");
+
+        assert!(invocation.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_single_argv_for_unsplittable_claude_bash_commands() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"Bash","tool_input":{"command":"echo \"unterminated"}}"#,
+        )
+        .expect("parse hook payload")
+        .expect("supported tool");
+
+        assert_eq!(
+            invocation,
+            ToolInvocation {
+                tool: ToolKind::Bash,
+                display: "echo \"unterminated".to_string(),
+                runtime_name: None,
+                payload: ToolPayload::Bash {
+                    argv: vec!["echo \"unterminated".into()],
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_claude_hook_payloads() {
+        let invocation = ToolInvocation::from_claude_pre_tool_use(
+            r#"{"tool_name":"Read","tool_input":{"file_path":"src/main.rs"}}"#,
+        )
+        .expect("parse hook payload");
+
+        assert!(invocation.is_none());
     }
 }
