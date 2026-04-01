@@ -1,6 +1,6 @@
 # Architecture
 
-The codebase is set up as a Rust workspace with a single initial CLI crate, `ddl`.
+The codebase is a Rust workspace with a single CLI crate, `ddl`.
 
 The current base is split into a few stable responsibilities:
 
@@ -9,7 +9,7 @@ The current base is split into a few stable responsibilities:
 - domain types for runs, timelines, checkpoints, and resumability
 - metadata encoding and persistence
 - repo-local state management under `.daedalus/`
-- runtime wrapper preparation for supported agent CLIs
+- runtime wrapper preparation for Claude Code
 - a shadow git repository used to version checkpoint snapshots
 
-This base favors a narrow, credible v1 over premature abstraction. The first implementation keeps a single storage backend, a small command surface, and a shell-first runtime model while routing checkpoint matching through a shared internal tool invocation pipeline. Claude Code now emits `Edit`, `MultiEdit`, `Write`, and `Bash` invocations through a supported `PreToolUse` hook, while Codex remains on the Bash-only path.
+This base favors a narrow, credible v1 over premature abstraction. The current implementation keeps a single storage backend, a small command surface, and a shell-first runtime model while routing checkpoint matching through a shared internal tool invocation pipeline. Claude Code emits `Edit`, `MultiEdit`, `Write`, and `Bash` invocations through a supported `PreToolUse` hook, and `daedalus` stores the metadata needed to restore the workspace and attempt a Claude session rewind.

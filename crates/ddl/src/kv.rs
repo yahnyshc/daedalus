@@ -127,8 +127,8 @@ mod tests {
             &path,
             &[
                 ("id", "cp_1".to_string()),
-                ("arg", "codex".to_string()),
-                ("arg", "run --dangerous".to_string()),
+                ("arg", "claude".to_string()),
+                ("arg", "--print".to_string()),
             ],
         )
         .expect("write metadata");
@@ -140,7 +140,7 @@ mod tests {
         );
         assert_eq!(
             repeated_values(&pairs, "arg"),
-            vec!["codex".to_string(), "run --dangerous".to_string()]
+            vec!["claude".to_string(), "--print".to_string()]
         );
 
         fs::remove_file(path).expect("remove temp file");

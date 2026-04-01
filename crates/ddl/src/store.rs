@@ -186,22 +186,18 @@ impl DaedalusStore {
             status: RunStatus::Running,
             last_checkpoint_id: None,
             head_checkpoint_id: None,
-            resumability: self.initial_run_resumability(runtime),
+            resumability: self.initial_run_resumability(),
         };
         self.write_run(&run)?;
-        let runtime_metadata = self.initialize_runtime_metadata(&run_id, runtime)?;
-        if runtime == SupportedRuntime::Claude && runtime_metadata.is_some() {
-            run.resumability = Resumability::Full;
-            self.write_run(&run)?;
-        }
+        let runtime_metadata = self.initialize_runtime_metadata(&run_id)?;
+        run.resumability = Resumability::Full;
+        self.write_run(&run)?;
 
         let shell_context = ShellWrapperContext {
             run_id: run_id.clone(),
             timeline_id: timeline_id.clone(),
             runtime,
-            claude_session_id: runtime_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.claude_session_id.clone()),
+            claude_session_id: runtime_metadata.claude_session_id.clone(),
         };
         let status = self.execute_owned_command(&command, Some(&shell_context))?;
 
@@ -546,29 +542,17 @@ impl DaedalusStore {
         })
     }
 
-    fn initial_run_resumability(&self, runtime: SupportedRuntime) -> Resumability {
-        match runtime {
-            SupportedRuntime::Claude => Resumability::Partial,
-            SupportedRuntime::Codex => Resumability::Full,
-        }
+    fn initial_run_resumability(&self) -> Resumability {
+        Resumability::Partial
     }
 
-    fn initialize_runtime_metadata(
-        &self,
-        run_id: &str,
-        runtime: SupportedRuntime,
-    ) -> Result<Option<RuntimeMetadataRecord>> {
-        match runtime {
-            SupportedRuntime::Claude => {
-                let metadata = RuntimeMetadataRecord {
-                    runtime_name: runtime.as_str().to_string(),
-                    claude_session_id: Some(Uuid::new_v4().to_string()),
-                };
-                self.write_runtime_metadata(run_id, &metadata)?;
-                Ok(Some(metadata))
-            }
-            SupportedRuntime::Codex => Ok(None),
-        }
+    fn initialize_runtime_metadata(&self, run_id: &str) -> Result<RuntimeMetadataRecord> {
+        let metadata = RuntimeMetadataRecord {
+            runtime_name: SupportedRuntime::Claude.as_str().to_string(),
+            claude_session_id: Some(Uuid::new_v4().to_string()),
+        };
+        self.write_runtime_metadata(run_id, &metadata)?;
+        Ok(metadata)
     }
 
     fn read_runtime_metadata(&self, run_id: &str) -> Result<Option<RuntimeMetadataRecord>> {
@@ -1469,14 +1453,14 @@ mod tests {
         store.init().expect("initialize store");
         fs::write(repo_root.join("test.txt"), "hello").expect("seed file");
 
-        let (run_id, timeline_id) = create_active_run(&store, "codex");
+        let (run_id, timeline_id) = create_active_run(&store, "claude");
 
         let previous = std::env::current_dir().expect("current dir");
         std::env::set_current_dir(&repo_root).expect("cd temp repo");
         unsafe {
             std::env::set_var(ENV_RUN_ID, &run_id);
             std::env::set_var(ENV_TIMELINE_ID, &timeline_id);
-            std::env::set_var(ENV_RUNTIME, "codex");
+            std::env::set_var(ENV_RUNTIME, "claude");
         }
 
         let exit_code = store
@@ -1494,7 +1478,7 @@ mod tests {
         let checkpoints = store.list_checkpoints().expect("list checkpoints");
         assert_eq!(checkpoints.len(), 1);
         assert_eq!(checkpoints[0].timeline_id, timeline_id);
-        assert_eq!(checkpoints[0].runtime_name.as_deref(), Some("codex"));
+        assert_eq!(checkpoints[0].runtime_name.as_deref(), Some("claude"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
@@ -2060,58 +2044,13 @@ mod tests {
     }
 
     #[test]
-    fn non_claude_rewind_keeps_existing_behavior() {
-        let _guard = lock_tests();
-        let repo_root = create_temp_repo("codex-resume");
-
-        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
-        store.init().expect("initialize store");
-        let args_path = repo_root.join("codex-resume-args.txt");
-        let command = vec![
-            create_fake_agent_script(&repo_root, "codex", &args_path),
-            "--resume".to_string(),
-            "keep-me".to_string(),
-        ];
-        let (run_id, timeline_id) =
-            create_active_run_with_command(&store, command, Resumability::Full);
-
-        let previous = std::env::current_dir().expect("current dir");
-        std::env::set_current_dir(&repo_root).expect("cd temp repo");
-        let checkpoint = store
-            .create_checkpoint_internal(
-                &timeline_id,
-                &run_id,
-                None,
-                CheckpointKind::ProtectedAction,
-                "before-shell".to_string(),
-                super::CheckpointTriggerMetadata {
-                    tool_type: Some("bash".to_string()),
-                    command: Some("rm README.md".to_string()),
-                    runtime_name: Some("codex".to_string()),
-                },
-            )
-            .expect("create checkpoint");
-        fs::remove_file(&args_path).ok();
-        let exit_code = store.rewind(&checkpoint.id).expect("rewind checkpoint");
-        std::env::set_current_dir(previous).expect("restore cwd");
-
-        assert_eq!(exit_code, 0);
-        let args = fs::read_to_string(&args_path).expect("read agent args");
-        assert!(args.contains("--resume"));
-        assert!(args.contains("keep-me"));
-
-        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
-    }
-
-    #[test]
     fn non_claude_session_head_checkpoint_cannot_be_rewound() {
         let _guard = lock_tests();
         let repo_root = create_temp_repo("session-head-rewind");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
-        let args_path = repo_root.join("codex-head-args.txt");
-        let command = vec![create_fake_agent_script(&repo_root, "codex", &args_path)];
+        let command = vec!["/bin/sh".to_string()];
         let (run_id, timeline_id) =
             create_active_run_with_command(&store, command, Resumability::Full);
 
@@ -2137,7 +2076,22 @@ mod tests {
                 .to_string()
                 .contains("session head snapshot and cannot be rewound for this runtime")
         );
-        assert!(!args_path.exists());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn run_agent_rejects_non_claude_runtime() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("unsupported-runtime");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let error = store
+            .run_agent(vec!["codex".to_string()])
+            .expect_err("reject unsupported runtime");
+        assert!(error.to_string().contains("supported runtime: claude"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
