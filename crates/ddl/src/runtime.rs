@@ -14,7 +14,6 @@ const CLAUDE_PRE_TOOL_USE_HOOK_NAME: &str = "claude-pre-tool-use";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SupportedRuntime {
-    Codex,
     Claude,
 }
 
@@ -32,17 +31,13 @@ impl SupportedRuntime {
             .unwrap_or(first);
 
         match name {
-            "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             other => Err(DdlError::UnsupportedRuntime(other.to_string())),
         }
     }
 
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-        }
+        "claude"
     }
 }
 
@@ -87,17 +82,13 @@ pub fn prepare_runtime_command(
     state_dir: &Path,
     context: &ShellWrapperContext,
 ) -> Result<Vec<String>> {
-    match context.runtime {
-        SupportedRuntime::Codex => Ok(command.to_vec()),
-        SupportedRuntime::Claude => prepare_claude_command(command, state_dir, context),
-    }
+    prepare_claude_command(command, state_dir, context)
 }
 
 pub fn current_shell_context() -> Option<ShellWrapperContext> {
     let run_id = env::var(ENV_RUN_ID).ok()?;
     let timeline_id = env::var(ENV_TIMELINE_ID).ok()?;
     let runtime = match env::var(ENV_RUNTIME).ok()?.as_str() {
-        "codex" => SupportedRuntime::Codex,
         "claude" => SupportedRuntime::Claude,
         _ => return None,
     };
@@ -319,35 +310,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_command_is_unchanged() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "ddl-runtime-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&temp_dir).expect("create temp dir");
-
-        let command = vec!["codex".to_string(), "--resume".to_string()];
-        let prepared = prepare_runtime_command(
-            &command,
-            &temp_dir,
-            &ShellWrapperContext {
-                run_id: "run_test".to_string(),
-                timeline_id: "tl_test".to_string(),
-                runtime: SupportedRuntime::Codex,
-                claude_session_id: None,
-            },
-        )
-        .expect("prepare command");
-
-        assert_eq!(prepared, command);
-
-        std::fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
-    }
-
-    #[test]
     fn claude_bare_is_rejected() {
         let temp_dir = std::env::temp_dir().join(format!(
             "ddl-runtime-test-{}",
@@ -373,5 +335,11 @@ mod tests {
         assert!(error.to_string().contains("claude `--bare` disables hooks"));
 
         std::fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn detect_rejects_non_claude_runtime() {
+        let error = SupportedRuntime::detect(&["codex".to_string()]).expect_err("reject codex");
+        assert!(error.to_string().contains("supported runtime: claude"));
     }
 }

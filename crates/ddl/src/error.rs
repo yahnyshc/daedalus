@@ -38,7 +38,7 @@ impl Display for DdlError {
             ),
             Self::UnsupportedRuntime(runtime) => write!(
                 f,
-                "runtime `{runtime}` is not yet supported; supported runtimes: codex, claude"
+                "runtime `{runtime}` is not supported; supported runtime: claude"
             ),
             Self::NotFound { kind, id } => write!(f, "{kind} `{id}` was not found"),
             Self::CommandFailed {

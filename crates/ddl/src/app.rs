@@ -171,7 +171,7 @@ fn parse_internal(parts: Vec<String>) -> Result<CommandLine> {
 fn parse_run(parts: Vec<String>) -> Result<CommandLine> {
     if parts.len() < 4 || parts[2] != "--" {
         return Err(DdlError::InvalidInput(
-            "usage: ddl run -- <agent command>".to_string(),
+            "usage: ddl run -- claude <args...>".to_string(),
         ));
     }
 
@@ -343,11 +343,11 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
 fn print_help() {
     println!(
         "\
-daedalus v1 CLI scaffold
+daedalus v1 CLI
 
 Usage:
   ddl init
-  ddl run -- <agent command>
+  ddl run -- claude <args...>
   ddl shell -- <command>
   ddl log
   ddl diff [checkpoint_a] [checkpoint_b]

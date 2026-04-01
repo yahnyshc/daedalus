@@ -57,7 +57,6 @@ pub fn session_title(timeline: &TimelineRecord, run: &RunRecord) -> String {
 pub fn runtime_display_name(run: &RunRecord) -> String {
     match SupportedRuntime::detect(&run.command) {
         Ok(SupportedRuntime::Claude) => "Claude".to_string(),
-        Ok(SupportedRuntime::Codex) => "Codex".to_string(),
         Err(_) => run
             .command
             .first()

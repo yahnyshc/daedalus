@@ -19,9 +19,9 @@ Runtime state is stored in a hidden repo-local directory:
 Notes:
 
 - `runs/`, `timelines/`, and `checkpoints/` contain hex-encoded line-based metadata records.
-- `config.json` contains the v1 checkpointing rules. Older repos with only the legacy `config` file should be re-initialized or migrated.
-- `runtime/` contains per-run wrapper shims, hook helpers, and runtime metadata such as Claude session ids plus experimental Claude rewind snapshots.
-- `runtime/<run_id>/session.meta` stores rewind-relevant runtime metadata for owned runs.
+- `config.json` contains the current checkpointing rules. Older repos with only the legacy `config` file should be re-initialized or migrated.
+- `runtime/` contains per-run wrapper shims, Claude hook helpers, and runtime metadata such as Claude session ids plus experimental Claude rewind snapshots.
+- `runtime/<run_id>/session.meta` stores rewind-relevant metadata for owned Claude runs.
 - `runtime/<run_id>/claude-checkpoints/<checkpoint_id>/` stores experimental Claude local rewind state when captured.
   v1 only snapshots `~/.claude/projects/<escaped-cwd>/<session_id>.jsonl` and `~/.claude/file-history/<session_id>/`.
 - `shadow/` is a git repository dedicated to checkpoint storage.

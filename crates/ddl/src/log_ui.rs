@@ -425,7 +425,7 @@ impl LogUiApp {
 
         let items = if self.timelines.is_empty() {
             vec![ListItem::new(Line::from(
-                "No sessions recorded yet. Run `ddl run -- ...` or `ddl shell -- ...` first.",
+                "No sessions recorded yet. Run `ddl run -- claude ...` or `ddl shell -- ...` first.",
             ))]
         } else {
             self.timelines

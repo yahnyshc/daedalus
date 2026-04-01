@@ -3,7 +3,7 @@ name = "ddl"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI scaffold for daedalus, a checkpointing layer for coding agents."
+description = "Claude Code recovery with repo restore and session rewind."
 
 [lib]
 name = "ddl"
