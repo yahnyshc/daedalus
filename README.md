@@ -2,7 +2,7 @@
 
 Repo-local checkpointing and recovery for Claude Code runs.
 
-`daedalus` wraps Claude Code, creates checkpoints before configured mutation boundaries, and gives you two recovery paths:
+`daedalus` wraps Claude Code, creates checkpoints before configured mutation tools, and gives you two recovery paths:
 
 - `ddl restore` restores the workspace to a checkpoint
 - `ddl rewind` restores the workspace and resumes the Claude-backed run when rewind data was captured
