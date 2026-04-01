@@ -1,49 +1,87 @@
 # daedalus
 
-Version control for vibe coders.
+Repo-local checkpointing and recovery for Claude Code runs.
 
-Git owns history. `daedalus` protects both context and repo.
+`daedalus` wraps Claude Code, creates checkpoints before configured mutation boundaries, and gives you two recovery paths:
+
+- `ddl restore` restores the workspace to a checkpoint
+- `ddl rewind` restores the workspace and resumes the Claude-backed run when rewind data was captured
+
+Git still owns commit history. `daedalus` handles the failure mode where an agent run was going fine until one edit or shell command damaged the working state.
+
+> Status: early and intentionally narrow. `daedalus` is currently Claude-first and only supports Claude Code for `ddl run`.
 
 <img width="1111" height="663" alt="Screenshot 2026-04-01 at 19 40 08" src="https://github.com/user-attachments/assets/3a62120e-504c-49d9-b390-04ae73b16af1" />
 
-`daedalus` checkpoints a Claude run before risky actions, then gives you two clean recovery moves:
+## What It Looks Like
 
-- `ddl restore` puts the workspace back at the checkpoint
-- `ddl rewind` restores the workspace and resumes the Claude-backed run when context was captured
+Run Claude under `daedalus`:
 
-This is for the moment when Claude already made useful progress, then one edit or shell command trashed the working state.
-
-## The bad moment
-
-```text
-claude: "I cleaned things up"
-you:     "why is half the repo gone"
+```bash
+ddl run -- claude
 ```
 
-`daedalus` is built for that exact failure mode:
+If a protected action goes wrong:
 
-- Claude is in the middle of a real run
-- a risky edit or shell command goes wrong
-- you want the workspace back without safety commits
-- you want Claude back at the last safe point instead of starting over
-
-## How it works
-
-```text
-run protected
-    |
-    v
-checkpoint before Edit(*) / MultiEdit(*) / Write(*) / Bash(...)
-    |
-    v
-bad action lands
-    |
-  +-+-------------------+
-  |                     |
-  v                     v
-restore             rewind
-files only          files + Claude-backed session resume
+```bash
+ddl log
+ddl restore <checkpoint_id>
 ```
+
+If the checkpoint came from a Claude-backed run and rewind state was captured:
+
+```bash
+ddl rewind <checkpoint_id>
+```
+
+That is the whole model:
+
+- checkpoint before risky action
+- inspect recent checkpoints
+- restore files, or restore files and resume the run
+
+## Why It Exists
+
+AI coding workflows have a specific failure mode:
+
+- the agent has already made useful progress
+- a later edit or shell command damages the workspace
+- a normal Git revert is too coarse or too late
+- starting a fresh agent session throws away useful context
+
+`daedalus` is built for that case. It does not replace Git. It adds short-range recovery around live agent actions.
+
+## Quickstart
+
+Install the local CLI:
+
+```bash
+cargo install --path crates/ddl
+```
+
+Initialize repo-local state:
+
+```bash
+ddl init
+```
+
+Run Claude under protection:
+
+```bash
+ddl run -- claude
+```
+
+Inspect recent checkpoints and recover when needed:
+
+```bash
+ddl log
+ddl restore <checkpoint_id>
+ddl rewind <checkpoint_id>
+```
+
+`ddl log` opens an interactive recovery console in a TTY and prints plain text in non-interactive contexts.
+
+## How Checkpointing Works
 
 `daedalus` owns the Claude run and checkpoints before configured mutation boundaries.
 
@@ -54,7 +92,7 @@ Today that means:
 - `Write(*)`
 - configured `Bash(...)` rules
 
-`ddl init` writes the repo-local config at `.daedalus/config.json`:
+`ddl init` writes a repo-local config at `.daedalus/config.json`:
 
 ```json
 {
@@ -71,91 +109,52 @@ Today that means:
 }
 ```
 
-## `daedalus` vs Claude Rewind
-
-Claude Rewind is prompt-oriented. `daedalus` is action-oriented.
-
-If you want to step back in the conversation, Claude Rewind is the right mental model. If you want a checkpoint right before `Bash(rm -rf tmp)` or some other risky tool action, that is what `daedalus` is for.
+Recovery flow:
 
 ```text
-Claude Rewind
-  prompt -> prompt -> prompt
-              ^
-      rewind conversation state
-
-daedalus
-  Edit(*) -> Write(*) -> Bash(*) -> damage
-                    ^
-         checkpoint before impact
+Claude run
+    |
+    v
+checkpoint before protected action
+    |
+    v
+bad action lands
+    |
+  +-+-------------------+
+  |                     |
+  v                     v
+restore             rewind
+files only          files + Claude session resume
 ```
 
-The practical difference:
+## Restore vs Rewind
 
-- Claude Rewind operates at the prompt / conversation layer
-- `daedalus` checkpoints before concrete tool actions
-- `daedalus` covers file edits and configured shell commands
-- if the blast radius came from Bash, that distinction matters
+Use `ddl restore` when you want the workspace back at a checkpoint.
 
-## Example log
+Use `ddl rewind` when all of the following are true:
 
-A real `ddl log` screenshot belongs here.
+- the checkpoint came from a Claude-backed run owned by `daedalus`
+- workspace snapshot data still exists
+- Claude rewind state was captured for that checkpoint
 
-The screenshot should sit here as proof that the recovery model is not conceptual. The hero explains the idea; the log proves the tool exists.
+`ddl rewind` first restores the checkpoint, then attempts to resume the same Claude session. If Claude context is unavailable, or the checkpoint is not rewindable, `ddl rewind` fails clearly and `ddl restore` remains available.
 
-<!-- Insert real ddl log screenshot here -->
+## What Gets Protected
 
-## Quickstart
+Protected today:
 
-Install the local CLI:
+- workspace files
+- repo-local checkpoint metadata under `.daedalus/`
+- Claude-backed local rewind snapshot data when captured
 
-```bash
-cargo install --path crates/ddl
-```
+Checkpoint coverage today:
 
-Initialize a repo:
+- `Edit(*)`
+- `MultiEdit(*)`
+- `Write(*)`
+- configured `Bash(...)`
 
-```bash
-ddl init
-```
-
-Run Claude under protection:
-
-```bash
-ddl run -- claude
-```
-
-When something goes wrong:
-
-```bash
-ddl log
-ddl restore <checkpoint_id>
-ddl rewind <checkpoint_id>
-```
-
-`ddl log` opens an interactive recovery console in a TTY and prints plain text in non-interactive contexts.
-
-## What gets protected
-
-```text
-recovery scope:
-  workspace files
-  repo-local checkpoint metadata under .daedalus/
-  Claude-backed local rewind snapshot when captured
-
-checkpoint coverage:
-  Edit(*)
-  MultiEdit(*)
-  Write(*)
-  configured Bash(...)
-
-not protected:
-  .git internals
-  external side effects outside the workspace
-  all possible ~/.claude state
-  unsupported runtimes
-```
-
-For Claude-backed runs owned by `daedalus`, checkpoints also capture:
+For Claude-backed runs owned by `daedalus`, checkpoints also record:
 
 - the Claude session id
 - a best-effort local Claude rewind snapshot under `.daedalus/runtime/<run_id>/claude-checkpoints/<checkpoint_id>/`
@@ -164,6 +163,18 @@ That snapshot currently covers:
 
 - `~/.claude/projects/<escaped-cwd>/<session_id>.jsonl`
 - `~/.claude/file-history/<session_id>/`
+
+## Current Limits
+
+The v1 scope is intentionally narrow:
+
+- Claude Code only. Other runtimes are unsupported for `ddl run`.
+- `ddl rewind` only works for Claude-backed checkpoints with captured rewind state.
+- `.git` is out of scope. `daedalus` does not snapshot, restore, or protect repo metadata.
+- External side effects outside the workspace are not rewound.
+- The current Claude snapshot is best-effort and does not cover all of `~/.claude`, subagent state, task state, telemetry, or vendor UI state.
+- Symlink snapshots are rejected.
+- `ddl restore` replaces the current workspace snapshot and removes files created after the checkpoint while leaving `.git`, `.daedalus`, and `target` untouched.
 
 ## Commands
 
@@ -177,33 +188,25 @@ ddl restore <checkpoint_id>
 ddl rewind <checkpoint_id>
 ```
 
+- `ddl init` creates repo-local state, initializes the shadow git repository, and writes `.daedalus/config.json`
 - `ddl run` launches Claude from the repo root with checkpoint protection enabled
 - `ddl shell` runs a shell command through the same checkpoint matcher
-- `ddl restore` is destructive workspace-file recovery only
-- `ddl rewind` is workspace recovery plus Claude resume when the checkpoint is Claude-backed and rewindable
-
-## Current limits
-
-- Claude Code only. Other runtimes are intentionally unsupported for now.
-- `ddl rewind` only works for Claude-backed checkpoints when the workspace snapshot exists and the Claude local rewind snapshot was captured.
-- If Claude context is unavailable, or the checkpoint is not Claude-backed, `ddl rewind` fails clearly and `ddl restore` remains available.
-- `daedalus` does not snapshot, restore, or protect `.git`. If repo metadata is damaged, use Git or external recovery separately.
-- External side effects outside the configured workspace are not rewound.
-- The current Claude snapshot is best-effort and does not cover all of `~/.claude`, subagent state, or vendor UI state.
-- Symlink snapshots are still rejected.
-- `ddl restore` replaces the current workspace snapshot and removes files created after the checkpoint, while leaving `.git`, `.daedalus`, and `target` untouched.
+- `ddl log` shows recent checkpoints and available recovery actions
+- `ddl diff` compares checkpoint snapshots
+- `ddl restore` is destructive workspace recovery only
+- `ddl rewind` is workspace recovery plus Claude resume when the checkpoint is rewindable
 
 ## Status
 
-The repo already has a working shell-first v1:
+The current shell-first base includes:
 
 - repo-local `.daedalus/` state
-- shadow git-backed snapshot storage
+- a shadow git-backed snapshot store
 - automatic checkpointing before configured Bash rules
 - Claude `PreToolUse` hook checkpointing for `Edit`, `MultiEdit`, `Write`, and `Bash`
-- interactive `ddl log` recovery console
+- interactive `ddl log` recovery
 
-The main thing to evaluate now is whether Claude restore + rewind is a real workflow improvement in practice.
+The main question for the project is still practical: does restore plus rewind materially improve real AI-assisted development workflows.
 
 ## Docs
 
