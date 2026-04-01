@@ -11,7 +11,6 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
       "MultiEdit(*)",
       "Write(*)",
       "Bash(npm install:*)",
-      "Bash(git rebase:*)",
       "Bash(rm:*)",
       "Bash(mv:*)"
     ]
@@ -769,7 +768,7 @@ mod tests {
     #[test]
     fn parses_default_json_config() {
         let config = DaedalusConfig::parse(DEFAULT_CONFIG_JSON).expect("parse config");
-        assert_eq!(config.checkpointing.before.len(), 7);
+        assert_eq!(config.checkpointing.before.len(), 6);
         assert_eq!(config.checkpointing.before[0].tool, ToolKind::Edit);
         assert_eq!(config.checkpointing.before[1].tool, ToolKind::MultiEdit);
         assert_eq!(config.checkpointing.before[3].tool, ToolKind::Bash);
@@ -808,9 +807,8 @@ mod tests {
         assert!(
             config
                 .matching_rule(&ToolInvocation::from_shell_command(vec![
-                    "git".into(),
-                    "rebase".into(),
-                    "main".into(),
+                    "rm".into(),
+                    "README.md".into(),
                 ]))
                 .is_some()
         );

@@ -12,4 +12,10 @@ The current base is split into a few stable responsibilities:
 - runtime wrapper preparation for Claude Code
 - a shadow git repository used to version checkpoint snapshots
 
+The product boundary is intentionally narrow:
+
+- workspace files are recoverable from `.daedalus`
+- Claude local state is recoverable on Claude-backed checkpoints when captured
+- the live repository `.git` directory is not part of `daedalus` recovery and remains Git's responsibility
+
 This base favors a narrow, credible v1 over premature abstraction. The current implementation keeps a single storage backend, a small command surface, and a shell-first runtime model while routing checkpoint matching through a shared internal tool invocation pipeline. Claude Code emits `Edit`, `MultiEdit`, `Write`, and `Bash` invocations through a supported `PreToolUse` hook, and `daedalus` stores the metadata needed to restore the workspace and attempt a Claude session rewind.

@@ -20,8 +20,8 @@ use crate::error::Result;
 use crate::model::{CheckpointKind, CheckpointRecord, RunRecord, TimelineRecord};
 use crate::presentation::{
     RecoveryCapability, continuation_label, format_absolute_time, format_relative_time,
-    format_runtime, latest_action_label, recovery_capability, session_status_label,
-    session_title, tool_event_label, tool_event_preview,
+    format_runtime, latest_action_label, recovery_capability, session_status_label, session_title,
+    tool_event_label, tool_event_preview,
 };
 use crate::store::DaedalusStore;
 
@@ -417,7 +417,11 @@ impl LogUiApp {
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(if timeline.continuation.is_some() { 6 } else { 5 }),
+                Constraint::Length(if timeline.continuation.is_some() {
+                    6
+                } else {
+                    5
+                }),
                 Constraint::Min(8),
                 Constraint::Length(3),
             ])
@@ -458,8 +462,7 @@ impl LogUiApp {
             header_lines.push(Line::from(continuation.clone()));
         }
 
-        let header = Paragraph::new(Text::from(header_lines))
-        .block(
+        let header = Paragraph::new(Text::from(header_lines)).block(
             Block::default()
                 .title(" Session ")
                 .borders(Borders::ALL)
@@ -842,9 +845,9 @@ impl LogUiApp {
     }
 
     fn selected_target(&self) -> Option<&CheckpointSummary> {
-        self.selected_timeline()?.recovery_points.get(
-            self.checkpoint_state.selected().unwrap_or(0),
-        )
+        self.selected_timeline()?
+            .recovery_points
+            .get(self.checkpoint_state.selected().unwrap_or(0))
     }
 }
 
@@ -957,7 +960,9 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
                 .as_deref()
                 .and_then(|checkpoint_id| checkpoint_by_id.get(checkpoint_id)),
         );
-        let end_timestamp = recovery_points.first().map(|item| item.checkpoint.created_at);
+        let end_timestamp = recovery_points
+            .first()
+            .map(|item| item.checkpoint.created_at);
         let runtime = format_runtime(timeline.created_at, end_timestamp);
 
         items.push(TimelineSummary {

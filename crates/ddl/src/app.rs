@@ -7,8 +7,7 @@ use crate::error::{DdlError, Result};
 use crate::log_ui::{LogUiExit, run_log_ui};
 use crate::presentation::{
     RecoveryCapability, continuation_label, format_absolute_time, latest_action_label,
-    recovery_capability, session_status_label, session_title, tool_event_label,
-    tool_event_preview,
+    recovery_capability, session_status_label, session_title, tool_event_label, tool_event_preview,
 };
 use crate::store::DaedalusStore;
 
@@ -309,9 +308,9 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
             output,
             "  Status: {}  |  Latest protected action: {}",
             session_status_label(&run.status),
-            latest_checkpoint.map(|item| latest_action_label(Some(item))).unwrap_or_else(
-                || latest_action_label(None),
-            )
+            latest_checkpoint
+                .map(|item| latest_action_label(Some(item)))
+                .unwrap_or_else(|| latest_action_label(None),)
         );
         if let Some(continuation) = continuation {
             let _ = writeln!(output, "  {continuation}");
