@@ -19,9 +19,9 @@ use ratatui::{Frame, Terminal};
 use crate::error::Result;
 use crate::model::{CheckpointKind, CheckpointRecord, RunRecord, TimelineRecord};
 use crate::presentation::{
-    RecoveryCapability, format_absolute_time, format_relative_time, format_runtime,
-    latest_action_label, recovery_capability, session_status_label, session_title,
-    tool_event_label, tool_event_preview,
+    RecoveryCapability, continuation_label, format_absolute_time, format_relative_time,
+    format_runtime, latest_action_label, recovery_capability, session_status_label,
+    session_title, tool_event_label, tool_event_preview,
 };
 use crate::store::DaedalusStore;
 
@@ -105,12 +105,6 @@ enum PendingActionKind {
     Rewind,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RecoveryFocus {
-    Head,
-    Actions,
-}
-
 #[derive(Clone)]
 struct PendingAction {
     kind: PendingActionKind,
@@ -121,7 +115,6 @@ struct LogUiApp {
     screen: Screen,
     timelines: Vec<TimelineSummary>,
     timeline_state: ListState,
-    recovery_focus: RecoveryFocus,
     checkpoint_state: ListState,
     file_state: ListState,
     diff_focus: DiffFocus,
@@ -143,7 +136,6 @@ impl LogUiApp {
             screen: Screen::Timelines,
             timelines,
             timeline_state,
-            recovery_focus: RecoveryFocus::Actions,
             checkpoint_state: ListState::default(),
             file_state: ListState::default(),
             diff_focus: DiffFocus::Files,
@@ -222,13 +214,9 @@ impl LogUiApp {
         key: KeyEvent,
         store: &DaedalusStore,
     ) -> Result<Option<LogUiExit>> {
-        let has_head = self
-            .selected_timeline()
-            .and_then(|item| item.head.as_ref())
-            .is_some();
         let checkpoints_len = self
             .selected_timeline()
-            .map(|item| item.checkpoints.len())
+            .map(|item| item.recovery_points.len())
             .unwrap_or(0);
 
         match key.code {
@@ -239,57 +227,19 @@ impl LogUiApp {
                 Ok(None)
             }
             KeyCode::Down => {
-                match self.recovery_focus {
-                    RecoveryFocus::Head if checkpoints_len > 0 => {
-                        self.recovery_focus = RecoveryFocus::Actions;
-                        if self.checkpoint_state.selected().is_none() {
-                            self.checkpoint_state.select(Some(0));
-                        }
-                    }
-                    RecoveryFocus::Actions => {
-                        move_selection(&mut self.checkpoint_state, checkpoints_len, 1);
-                    }
-                    RecoveryFocus::Head => {}
-                }
+                move_selection(&mut self.checkpoint_state, checkpoints_len, 1);
                 Ok(None)
             }
             KeyCode::Up => {
-                match self.recovery_focus {
-                    RecoveryFocus::Actions
-                        if self.checkpoint_state.selected() == Some(0) && has_head =>
-                    {
-                        self.recovery_focus = RecoveryFocus::Head;
-                    }
-                    RecoveryFocus::Actions => {
-                        move_selection(&mut self.checkpoint_state, checkpoints_len, -1);
-                    }
-                    RecoveryFocus::Head => {}
-                }
+                move_selection(&mut self.checkpoint_state, checkpoints_len, -1);
                 Ok(None)
             }
             KeyCode::PageDown => {
-                match self.recovery_focus {
-                    RecoveryFocus::Head if checkpoints_len > 0 => {
-                        self.recovery_focus = RecoveryFocus::Actions;
-                        self.checkpoint_state.select(Some(0));
-                    }
-                    RecoveryFocus::Actions => {
-                        move_selection(&mut self.checkpoint_state, checkpoints_len, 8);
-                    }
-                    RecoveryFocus::Head => {}
-                }
+                move_selection(&mut self.checkpoint_state, checkpoints_len, 8);
                 Ok(None)
             }
             KeyCode::PageUp => {
-                match self.recovery_focus {
-                    RecoveryFocus::Actions if has_head => {
-                        self.recovery_focus = RecoveryFocus::Head;
-                    }
-                    RecoveryFocus::Actions => {
-                        move_selection(&mut self.checkpoint_state, checkpoints_len, -8);
-                    }
-                    RecoveryFocus::Head => {}
-                }
+                move_selection(&mut self.checkpoint_state, checkpoints_len, -8);
                 Ok(None)
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -464,31 +414,17 @@ impl LogUiApp {
             self.draw_timelines(frame, area);
             return;
         };
-        let sections = if timeline.head.is_some() {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(5),
-                    Constraint::Length(4),
-                    Constraint::Min(8),
-                    Constraint::Length(3),
-                ])
-                .split(area)
-        } else {
-            Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(5),
-                    Constraint::Min(8),
-                    Constraint::Length(3),
-                ])
-                .split(area)
-        };
-        let actions_section = if timeline.head.is_some() { 2 } else { 1 };
-        let footer_section = if timeline.head.is_some() { 3 } else { 2 };
-        let row_width = list_row_width(sections[actions_section], LIST_HIGHLIGHT_SYMBOL);
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if timeline.continuation.is_some() { 6 } else { 5 }),
+                Constraint::Min(8),
+                Constraint::Length(3),
+            ])
+            .split(area);
+        let row_width = list_row_width(sections[1], LIST_HIGHLIGHT_SYMBOL);
 
-        let header = Paragraph::new(Text::from(vec![
+        let mut header_lines = vec![
             Line::from(vec![
                 Span::styled(
                     timeline.title.clone(),
@@ -511,13 +447,18 @@ impl LogUiApp {
                 "Started {}  |  Runtime {}  |  {} protected actions",
                 format_absolute_time(timeline.timeline.created_at),
                 timeline.runtime,
-                timeline.checkpoints.len()
+                timeline.protected_action_count
             )),
             Line::from(format!(
                 "Latest protected action: {}",
                 timeline.latest_action
             )),
-        ]))
+        ];
+        if let Some(continuation) = &timeline.continuation {
+            header_lines.push(Line::from(continuation.clone()));
+        }
+
+        let header = Paragraph::new(Text::from(header_lines))
         .block(
             Block::default()
                 .title(" Session ")
@@ -526,24 +467,13 @@ impl LogUiApp {
         );
         frame.render_widget(header, sections[0]);
 
-        if let Some(head) = &timeline.head {
-            frame.render_widget(
-                session_head_panel(
-                    head,
-                    panel_row_width(sections[1]),
-                    self.recovery_focus == RecoveryFocus::Head,
-                ),
-                sections[1],
-            );
-        }
-
-        let items = if timeline.checkpoints.is_empty() {
+        let items = if timeline.recovery_points.is_empty() {
             vec![ListItem::new(Line::from(
-                "No protected actions recorded in this session yet.",
+                "No recovery points recorded in this session yet.",
             ))]
         } else {
             timeline
-                .checkpoints
+                .recovery_points
                 .iter()
                 .map(|checkpoint| ListItem::new(checkpoint_row(checkpoint, row_width)))
                 .collect::<Vec<_>>()
@@ -552,7 +482,7 @@ impl LogUiApp {
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(" Protected Actions ")
+                    .title(" Recovery Points ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded),
             )
@@ -563,14 +493,14 @@ impl LogUiApp {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
-        frame.render_stateful_widget(list, sections[actions_section], &mut self.checkpoint_state);
+        frame.render_stateful_widget(list, sections[1], &mut self.checkpoint_state);
         frame.render_widget(
             footer_paragraph(
-                "Inspect protected actions before recovering",
+                "Inspect recovery points before recovering",
                 self.status_message.as_deref(),
-                "[up/down] move  [enter] diff  [r] restore  [w] rewind action  [esc] back  [q] quit",
+                "[up/down] move  [enter] diff  [r] restore  [w] rewind  [esc] back  [q] quit",
             ),
-            sections[footer_section],
+            sections[2],
         );
     }
 
@@ -721,7 +651,7 @@ impl LogUiApp {
             }
             PendingActionKind::Rewind => {
                 lines.push(Line::from(
-                    "This restores the snapshot and exits into the resumed runtime.",
+                    "This restores the snapshot and starts a new resumed session.",
                 ));
             }
         }
@@ -743,11 +673,8 @@ impl LogUiApp {
     fn enter_checkpoints(&mut self) {
         self.screen = Screen::Checkpoints;
         self.checkpoint_state = ListState::default();
-        self.recovery_focus = RecoveryFocus::Actions;
         if let Some(timeline) = self.selected_timeline() {
-            if timeline.head.is_some() {
-                self.recovery_focus = RecoveryFocus::Head;
-            } else if !timeline.checkpoints.is_empty() {
+            if !timeline.recovery_points.is_empty() {
                 self.checkpoint_state.select(Some(0));
             }
         }
@@ -808,23 +735,13 @@ impl LogUiApp {
             let selected_timeline_index = self.timeline_state.selected();
             if let Some(index) = selected_timeline_index {
                 let timeline = &self.timelines[index];
-                if timeline.head.as_ref().is_some_and(|item| {
-                    Some(item.checkpoint.id.as_str()) == selected_checkpoint_id.as_deref()
-                }) {
-                    self.recovery_focus = RecoveryFocus::Head;
-                } else {
-                    self.recovery_focus = RecoveryFocus::Actions;
-                    select_by_id(
-                        &mut self.checkpoint_state,
-                        &timeline.checkpoints,
-                        selected_checkpoint_id.as_deref(),
-                        |item| item.checkpoint.id.as_str(),
-                    );
-                    if self.checkpoint_state.selected().is_none() && timeline.head.is_some() {
-                        self.recovery_focus = RecoveryFocus::Head;
-                    }
-                }
-                if timeline.checkpoints.is_empty() && timeline.head.is_none() {
+                select_by_id(
+                    &mut self.checkpoint_state,
+                    &timeline.recovery_points,
+                    selected_checkpoint_id.as_deref(),
+                    |item| item.checkpoint.id.as_str(),
+                );
+                if timeline.recovery_points.is_empty() {
                     self.screen = Screen::Checkpoints;
                 }
             } else {
@@ -925,15 +842,9 @@ impl LogUiApp {
     }
 
     fn selected_target(&self) -> Option<&CheckpointSummary> {
-        let timeline = self.selected_timeline()?;
-        match self.recovery_focus {
-            RecoveryFocus::Head => timeline.head.as_ref(),
-            RecoveryFocus::Actions => self
-                .checkpoint_state
-                .selected()
-                .and_then(|index| timeline.checkpoints.get(index))
-                .or_else(|| timeline.head.as_ref()),
-        }
+        self.selected_timeline()?.recovery_points.get(
+            self.checkpoint_state.selected().unwrap_or(0),
+        )
     }
 }
 
@@ -943,8 +854,9 @@ struct TimelineSummary {
     run: RunRecord,
     title: String,
     runtime: String,
-    head: Option<CheckpointSummary>,
-    checkpoints: Vec<CheckpointSummary>,
+    continuation: Option<String>,
+    protected_action_count: usize,
+    recovery_points: Vec<CheckpointSummary>,
     latest_action: String,
     capability: RecoveryCapability,
 }
@@ -985,6 +897,11 @@ struct DiffFile {
 fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>> {
     let timelines = store.list_timelines()?;
     let checkpoints = store.list_checkpoints()?;
+    let checkpoint_by_id = checkpoints
+        .iter()
+        .cloned()
+        .map(|checkpoint| (checkpoint.id.clone(), checkpoint))
+        .collect::<BTreeMap<_, _>>();
 
     let mut grouped = BTreeMap::<String, Vec<CheckpointRecord>>::new();
     for checkpoint in checkpoints {
@@ -1001,7 +918,7 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
         timeline_checkpoints.sort_by_key(|item| std::cmp::Reverse(item.created_at));
 
         let mut head = None;
-        let mut checkpoints = Vec::new();
+        let mut protected_actions = Vec::new();
         for checkpoint in timeline_checkpoints {
             let summary = CheckpointSummary {
                 label: tool_event_label(&checkpoint),
@@ -1016,27 +933,31 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
                     head = Some(summary);
                 }
             } else {
-                checkpoints.push(summary);
+                protected_actions.push(summary);
             }
         }
 
-        let latest_action = if let Some(checkpoint) = checkpoints.first() {
+        let latest_action = if let Some(checkpoint) = protected_actions.first() {
             latest_action_label(Some(&checkpoint.checkpoint))
-        } else if head.is_some() {
-            "Session head available".to_string()
         } else {
             latest_action_label(None)
         };
-        let capability = checkpoints
+        let mut recovery_points = Vec::new();
+        if let Some(head) = head {
+            recovery_points.push(head);
+        }
+        recovery_points.extend(protected_actions);
+        let capability = recovery_points
             .first()
             .map(|item| item.capability)
-            .or_else(|| head.as_ref().map(|item| item.capability))
             .unwrap_or(RecoveryCapability::Unavailable);
         let title = session_title(&timeline, &run);
-        let end_timestamp = head
-            .as_ref()
-            .map(|item| item.checkpoint.created_at)
-            .or_else(|| checkpoints.first().map(|item| item.checkpoint.created_at));
+        let continuation = continuation_label(
+            run.rewind_source_checkpoint_id
+                .as_deref()
+                .and_then(|checkpoint_id| checkpoint_by_id.get(checkpoint_id)),
+        );
+        let end_timestamp = recovery_points.first().map(|item| item.checkpoint.created_at);
         let runtime = format_runtime(timeline.created_at, end_timestamp);
 
         items.push(TimelineSummary {
@@ -1044,8 +965,12 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
             run,
             title,
             runtime,
-            head,
-            checkpoints,
+            continuation,
+            protected_action_count: recovery_points
+                .iter()
+                .filter(|item| item.checkpoint.kind == CheckpointKind::ProtectedAction)
+                .count(),
+            recovery_points,
             latest_action,
             capability,
         });
@@ -1163,7 +1088,11 @@ fn timeline_row(timeline: &TimelineSummary, width: usize) -> Text<'static> {
     let status = session_status_label(&timeline.run.status);
     let capability = timeline.capability.label();
     let started = format_absolute_time(timeline.timeline.created_at);
-    let checkpoint_count = format!("{} protected actions", timeline.checkpoints.len());
+    let checkpoint_count = format!("{} protected actions", timeline.protected_action_count);
+    let summary = timeline
+        .continuation
+        .as_deref()
+        .unwrap_or(&timeline.latest_action);
     let title_width = line_budget(width, text_width(status) + text_width(capability) + 4, 24);
     let latest_action_width = line_budget(
         width,
@@ -1189,7 +1118,7 @@ fn timeline_row(timeline: &TimelineSummary, width: usize) -> Text<'static> {
             Span::raw("  |  "),
             Span::raw(checkpoint_count),
             Span::raw("  |  "),
-            Span::raw(truncate(&timeline.latest_action, latest_action_width)),
+            Span::raw(truncate(summary, latest_action_width)),
         ]),
     ])
 }
@@ -1217,6 +1146,16 @@ fn checkpoint_row(checkpoint: &CheckpointSummary, width: usize) -> Text<'static>
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
+            if checkpoint.checkpoint.kind == CheckpointKind::SessionHead {
+                Span::styled(
+                    "  Head",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            },
             Span::raw("  "),
             Span::styled(capability, recovery_style(checkpoint.capability)),
             Span::raw("  "),
@@ -1231,29 +1170,6 @@ fn checkpoint_row(checkpoint: &CheckpointSummary, width: usize) -> Text<'static>
             Span::raw(absolute_time),
         ]),
     ])
-}
-
-fn session_head_panel(
-    checkpoint: &CheckpointSummary,
-    width: usize,
-    focused: bool,
-) -> Paragraph<'static> {
-    let block = Block::default()
-        .title(if focused {
-            " Session Head [focus] "
-        } else {
-            " Session Head "
-        })
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default()
-        });
-    Paragraph::new(checkpoint_row(checkpoint, width))
-        .block(block)
-        .wrap(Wrap { trim: false })
 }
 
 fn footer_paragraph<'a>(
@@ -1328,10 +1244,6 @@ fn list_row_width(area: Rect, highlight_symbol: &str) -> usize {
     usize::from(area.width.saturating_sub(2))
         .saturating_sub(text_width(highlight_symbol))
         .saturating_sub(1)
-}
-
-fn panel_row_width(area: Rect) -> usize {
-    usize::from(area.width.saturating_sub(3))
 }
 
 fn line_budget(total_width: usize, fixed_width: usize, min_width: usize) -> usize {

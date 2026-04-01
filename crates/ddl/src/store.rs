@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, ToolInvocation};
 use crate::error::{DdlError, Result};
 use crate::ids::next_id;
+use crate::kv::{optional_value, read_pairs, required_value, write_pairs};
 use crate::model::{
     CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
     RuntimeMetadataRecord, TimelineRecord,
@@ -25,6 +26,7 @@ const PRESERVED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
 const CLAUDE_DIR_NAME: &str = ".claude";
 const CLAUDE_PROJECTS_DIR_NAME: &str = "projects";
 const CLAUDE_FILE_HISTORY_DIR_NAME: &str = "file-history";
+const PROVISIONAL_REWINDS_DIR_NAME: &str = "provisional-rewinds";
 
 #[derive(Clone, Debug)]
 pub struct DaedalusStore {
@@ -75,6 +77,95 @@ struct ClaudeRestoreOperation {
     source_path: PathBuf,
     had_original: bool,
     applied: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProvisionalRewindState {
+    last_checkpoint_id: Option<String>,
+}
+
+impl ProvisionalRewindState {
+    fn read(path: &Path) -> Result<Self> {
+        let map = read_pairs(path)?;
+        Ok(Self {
+            last_checkpoint_id: optional_value(&map, "last_checkpoint_id"),
+        })
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let mut pairs = Vec::new();
+        if let Some(last_checkpoint_id) = &self.last_checkpoint_id {
+            pairs.push(("last_checkpoint_id", last_checkpoint_id.clone()));
+        }
+        write_pairs(path, &pairs)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProvisionalCheckpointRecord {
+    id: String,
+    parent_checkpoint_id: Option<String>,
+    reason: String,
+    created_at: u64,
+    trigger_tool_type: Option<String>,
+    trigger_command: Option<String>,
+    runtime_name: Option<String>,
+    claude_session_id: Option<String>,
+    fingerprint: RuntimeFingerprint,
+}
+
+impl ProvisionalCheckpointRecord {
+    fn read(path: &Path) -> Result<Self> {
+        let map = read_pairs(path)?;
+        Ok(Self {
+            id: required_value(&map, "id")?,
+            parent_checkpoint_id: optional_value(&map, "parent_checkpoint_id"),
+            reason: required_value(&map, "reason")?,
+            created_at: required_value(&map, "created_at")?.parse()?,
+            trigger_tool_type: optional_value(&map, "trigger_tool_type"),
+            trigger_command: optional_value(&map, "trigger_command"),
+            runtime_name: optional_value(&map, "runtime_name"),
+            claude_session_id: optional_value(&map, "claude_session_id"),
+            fingerprint: RuntimeFingerprint {
+                cwd: required_value(&map, "cwd")?,
+                repo_root: required_value(&map, "repo_root")?,
+                git_head: required_value(&map, "git_head")?,
+                git_branch: required_value(&map, "git_branch")?,
+                git_dirty: required_value(&map, "git_dirty")? == "true",
+                git_version: required_value(&map, "git_version")?,
+            },
+        })
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let mut pairs = vec![
+            ("id", self.id.clone()),
+            ("reason", self.reason.clone()),
+            ("created_at", self.created_at.to_string()),
+            ("cwd", self.fingerprint.cwd.clone()),
+            ("repo_root", self.fingerprint.repo_root.clone()),
+            ("git_head", self.fingerprint.git_head.clone()),
+            ("git_branch", self.fingerprint.git_branch.clone()),
+            ("git_dirty", self.fingerprint.git_dirty.to_string()),
+            ("git_version", self.fingerprint.git_version.clone()),
+        ];
+        if let Some(parent_checkpoint_id) = &self.parent_checkpoint_id {
+            pairs.push(("parent_checkpoint_id", parent_checkpoint_id.clone()));
+        }
+        if let Some(trigger_tool_type) = &self.trigger_tool_type {
+            pairs.push(("trigger_tool_type", trigger_tool_type.clone()));
+        }
+        if let Some(trigger_command) = &self.trigger_command {
+            pairs.push(("trigger_command", trigger_command.clone()));
+        }
+        if let Some(runtime_name) = &self.runtime_name {
+            pairs.push(("runtime_name", runtime_name.clone()));
+        }
+        if let Some(claude_session_id) = &self.claude_session_id {
+            pairs.push(("claude_session_id", claude_session_id.clone()));
+        }
+        write_pairs(path, &pairs)
+    }
 }
 
 impl DaedalusStore {
@@ -186,6 +277,7 @@ impl DaedalusStore {
             status: RunStatus::Running,
             last_checkpoint_id: None,
             head_checkpoint_id: None,
+            rewind_source_checkpoint_id: None,
             resumability: self.initial_run_resumability(),
         };
         self.write_run(&run)?;
@@ -198,6 +290,7 @@ impl DaedalusStore {
             timeline_id: timeline_id.clone(),
             runtime,
             claude_session_id: runtime_metadata.claude_session_id.clone(),
+            provisional_rewind_id: None,
         };
         let status = self.execute_owned_command(&command, Some(&shell_context))?;
 
@@ -234,11 +327,7 @@ impl DaedalusStore {
                     let invocation = invocation
                         .clone()
                         .with_runtime_name(context.runtime.as_str());
-                    self.record_tool_checkpoint(
-                        &context.timeline_id,
-                        &context.run_id,
-                        &invocation,
-                    )?;
+                    self.record_contextual_tool_checkpoint(&context, &invocation)?;
                     None
                 }
                 None => {
@@ -282,7 +371,7 @@ impl DaedalusStore {
         }
 
         let invocation = invocation.with_runtime_name(context.runtime.as_str());
-        self.record_tool_checkpoint(&context.timeline_id, &context.run_id, &invocation)?;
+        self.record_contextual_tool_checkpoint(&context, &invocation)?;
         Ok(0)
     }
 
@@ -309,15 +398,18 @@ impl DaedalusStore {
             )));
         }
 
-        let mut run = self.read_run(&checkpoint.run_id)?;
+        let run = self.read_run(&checkpoint.run_id)?;
         self.restore(checkpoint_id)?;
 
-        run.last_checkpoint_id = Some(checkpoint.id.clone());
-        run.status = RunStatus::Running;
-        self.write_run(&run)?;
+        let rewind_started_at = unix_timestamp();
+        let provisional_rewind_id = next_id("rewind");
+        let provisional_run_id = format!("rewind-run-{provisional_rewind_id}");
+        let provisional_timeline_id = format!("rewind-tl-{provisional_rewind_id}");
+        self.write_provisional_rewind_state(&provisional_rewind_id, &ProvisionalRewindState::default())?;
 
         let runtime = SupportedRuntime::detect(&run.command).ok();
         let mut rewind_command = run.command.clone();
+        let mut claude_session_id = None;
         if runtime.is_some() {
             self.load_config()?;
         }
@@ -334,25 +426,50 @@ impl DaedalusStore {
                     }
                     Err(error) => return Err(error),
                 }
+                claude_session_id = checkpoint.claude_session_id.clone();
                 rewind_command = self.claude_resume_command(&run.command, &checkpoint);
             }
 
             Ok(ShellWrapperContext {
-                run_id: run.id.clone(),
-                timeline_id: checkpoint.timeline_id.clone(),
+                run_id: provisional_run_id.clone(),
+                timeline_id: provisional_timeline_id.clone(),
                 runtime,
-                claude_session_id: None,
+                claude_session_id: claude_session_id.clone(),
+                provisional_rewind_id: Some(provisional_rewind_id.clone()),
             })
         })
             .transpose()?;
 
         let status = self.execute_owned_command(&rewind_command, shell_context.as_ref())?;
-        run.status = if status.success() {
-            RunStatus::Succeeded
+        let diverged = self.rewind_has_diverged(&checkpoint, &provisional_rewind_id)?;
+
+        if diverged {
+            let resumed = self.create_rewind_run(
+                &run.command,
+                rewind_started_at,
+                Resumability::Full,
+                Some(checkpoint.id.as_str()),
+            )?;
+            if runtime == Some(SupportedRuntime::Claude) {
+                self.write_runtime_metadata(
+                    &resumed.run_id,
+                    &RuntimeMetadataRecord {
+                        runtime_name: SupportedRuntime::Claude.as_str().to_string(),
+                        claude_session_id: claude_session_id.clone(),
+                    },
+                )?;
+            }
+            self.materialize_provisional_rewind(
+                &provisional_rewind_id,
+                &resumed.run_id,
+                &resumed.timeline_id,
+            )?;
+            self.finalize_run(&resumed.run_id, &status)?;
         } else {
-            RunStatus::Failed
-        };
-        self.write_run(&run)?;
+            self.cleanup_provisional_rewind(&provisional_rewind_id)?;
+        }
+
+        self.cleanup_runtime_wrapper(&provisional_run_id)?;
 
         Ok(status.code().unwrap_or(1))
     }
@@ -532,6 +649,7 @@ impl DaedalusStore {
             status: RunStatus::Running,
             last_checkpoint_id: None,
             head_checkpoint_id: None,
+            rewind_source_checkpoint_id: None,
             resumability: Resumability::Full,
         };
         self.write_run(&run)?;
@@ -544,6 +662,42 @@ impl DaedalusStore {
 
     fn initial_run_resumability(&self) -> Resumability {
         Resumability::Partial
+    }
+
+    fn create_rewind_run(
+        &self,
+        command: &[String],
+        created_at: u64,
+        resumability: Resumability,
+        rewind_source_checkpoint_id: Option<&str>,
+    ) -> Result<StandaloneShellRun> {
+        let run_id = next_id("run");
+        let timeline_id = next_id("tl");
+
+        let timeline = TimelineRecord {
+            id: timeline_id.clone(),
+            run_id: run_id.clone(),
+            created_at,
+        };
+        self.write_timeline(&timeline)?;
+
+        let run = RunRecord {
+            id: run_id.clone(),
+            timeline_id: timeline_id.clone(),
+            command: command.to_vec(),
+            created_at,
+            status: RunStatus::Running,
+            last_checkpoint_id: None,
+            head_checkpoint_id: None,
+            rewind_source_checkpoint_id: rewind_source_checkpoint_id.map(ToOwned::to_owned),
+            resumability,
+        };
+        self.write_run(&run)?;
+
+        Ok(StandaloneShellRun {
+            timeline_id,
+            run_id,
+        })
     }
 
     fn initialize_runtime_metadata(&self, run_id: &str) -> Result<RuntimeMetadataRecord> {
@@ -561,6 +715,24 @@ impl DaedalusStore {
             return Ok(None);
         }
         Ok(Some(RuntimeMetadataRecord::read(&path)?))
+    }
+
+    fn record_contextual_tool_checkpoint(
+        &self,
+        context: &ShellWrapperContext,
+        invocation: &ToolInvocation,
+    ) -> Result<()> {
+        if let Some(rewind_id) = context.provisional_rewind_id.as_deref() {
+            self.record_provisional_tool_checkpoint(
+                rewind_id,
+                context.claude_session_id.as_deref(),
+                invocation,
+            )?;
+            Ok(())
+        } else {
+            self.record_tool_checkpoint(&context.timeline_id, &context.run_id, invocation)?;
+            Ok(())
+        }
     }
 
     fn record_tool_checkpoint(
@@ -587,6 +759,47 @@ impl DaedalusStore {
         run.last_checkpoint_id = Some(checkpoint.id.clone());
         self.write_run(&run)?;
 
+        Ok(checkpoint)
+    }
+
+    fn record_provisional_tool_checkpoint(
+        &self,
+        rewind_id: &str,
+        claude_session_id: Option<&str>,
+        invocation: &ToolInvocation,
+    ) -> Result<ProvisionalCheckpointRecord> {
+        let mut state = self.read_provisional_rewind_state(rewind_id)?;
+        let checkpoint_id = next_id("cp");
+        let snapshot_path = self.provisional_snapshot_path(rewind_id, &checkpoint_id);
+        if snapshot_path.exists() {
+            fs::remove_dir_all(&snapshot_path)?;
+        }
+        fs::create_dir_all(&snapshot_path)?;
+        copy_workspace_to_snapshot(&self.repo_root, &snapshot_path)?;
+
+        let claude_state_path = self.provisional_claude_state_path(rewind_id, &checkpoint_id);
+        let captured_claude_state =
+            self.snapshot_claude_local_state_to(&claude_state_path, claude_session_id)?;
+        if !captured_claude_state && claude_state_path.exists() {
+            fs::remove_dir_all(&claude_state_path)?;
+        }
+
+        let checkpoint = ProvisionalCheckpointRecord {
+            id: checkpoint_id.clone(),
+            parent_checkpoint_id: state.last_checkpoint_id.clone(),
+            reason: invocation.reason().to_string(),
+            created_at: unix_timestamp(),
+            trigger_tool_type: Some(invocation.tool.to_string()),
+            trigger_command: Some(invocation.display.clone()),
+            runtime_name: invocation.runtime_name.clone(),
+            claude_session_id: claude_session_id
+                .filter(|value| Self::is_valid_claude_session_id(value))
+                .map(ToOwned::to_owned),
+            fingerprint: self.capture_fingerprint()?,
+        };
+        self.write_provisional_checkpoint(rewind_id, &checkpoint)?;
+        state.last_checkpoint_id = Some(checkpoint.id.clone());
+        self.write_provisional_rewind_state(rewind_id, &state)?;
         Ok(checkpoint)
     }
 
@@ -814,6 +1027,39 @@ impl DaedalusStore {
             .join("session.meta")
     }
 
+    fn provisional_rewinds_root(&self) -> PathBuf {
+        self.state_dir.join("runtime").join(PROVISIONAL_REWINDS_DIR_NAME)
+    }
+
+    fn provisional_rewind_root(&self, rewind_id: &str) -> PathBuf {
+        self.provisional_rewinds_root().join(rewind_id)
+    }
+
+    fn provisional_rewind_state_path(&self, rewind_id: &str) -> PathBuf {
+        self.provisional_rewind_root(rewind_id).join("state.meta")
+    }
+
+    fn provisional_checkpoints_dir(&self, rewind_id: &str) -> PathBuf {
+        self.provisional_rewind_root(rewind_id).join("checkpoints")
+    }
+
+    fn provisional_checkpoint_meta_path(&self, rewind_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.provisional_checkpoints_dir(rewind_id)
+            .join(format!("{checkpoint_id}.meta"))
+    }
+
+    fn provisional_snapshot_path(&self, rewind_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.provisional_rewind_root(rewind_id)
+            .join(SNAPSHOT_DIR_NAME)
+            .join(checkpoint_id)
+    }
+
+    fn provisional_claude_state_path(&self, rewind_id: &str, checkpoint_id: &str) -> PathBuf {
+        self.provisional_rewind_root(rewind_id)
+            .join("claude-checkpoints")
+            .join(checkpoint_id)
+    }
+
     fn claude_checkpoint_state_path(&self, run_id: &str, checkpoint_id: &str) -> PathBuf {
         self.state_dir
             .join("runtime")
@@ -852,32 +1098,74 @@ impl DaedalusStore {
         self.claude_file_history_root(home_dir).join(session_id)
     }
 
+    fn read_provisional_rewind_state(&self, rewind_id: &str) -> Result<ProvisionalRewindState> {
+        let path = self.provisional_rewind_state_path(rewind_id);
+        if !path.exists() {
+            return Ok(ProvisionalRewindState::default());
+        }
+        ProvisionalRewindState::read(&path)
+    }
+
+    fn write_provisional_rewind_state(
+        &self,
+        rewind_id: &str,
+        state: &ProvisionalRewindState,
+    ) -> Result<()> {
+        let path = self.provisional_rewind_state_path(rewind_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        state.write(&path)
+    }
+
+    fn write_provisional_checkpoint(
+        &self,
+        rewind_id: &str,
+        checkpoint: &ProvisionalCheckpointRecord,
+    ) -> Result<()> {
+        let path = self.provisional_checkpoint_meta_path(rewind_id, &checkpoint.id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        checkpoint.write(&path)
+    }
+
+    fn list_provisional_checkpoints(
+        &self,
+        rewind_id: &str,
+    ) -> Result<Vec<ProvisionalCheckpointRecord>> {
+        let mut items = Vec::new();
+        for path in list_meta_files(&self.provisional_checkpoints_dir(rewind_id))? {
+            items.push(ProvisionalCheckpointRecord::read(&path)?);
+        }
+        items.sort_by_key(|item| item.created_at);
+        Ok(items)
+    }
+
     fn claude_rewind_snapshot_exists(&self, relative: &str) -> bool {
         path_has_entries(&self.state_dir.join(relative))
     }
 
-    fn snapshot_claude_local_state(
+    fn snapshot_claude_local_state_to(
         &self,
-        run_id: &str,
-        checkpoint_id: &str,
+        destination_root: &Path,
         session_id: Option<&str>,
-    ) -> Result<Option<String>> {
+    ) -> Result<bool> {
         let Some(session_id) = session_id.filter(|value| Self::is_valid_claude_session_id(value))
         else {
-            return Ok(None);
+            return Ok(false);
         };
         let Some(home_dir) = Self::claude_home_dir() else {
-            return Ok(None);
+            return Ok(false);
         };
 
-        let snapshot_path = self.claude_checkpoint_state_path(run_id, checkpoint_id);
-        if snapshot_path.exists() {
-            fs::remove_dir_all(&snapshot_path)?;
+        if destination_root.exists() {
+            fs::remove_dir_all(destination_root)?;
         }
-        fs::create_dir_all(&snapshot_path)?;
+        fs::create_dir_all(destination_root)?;
 
         let transcript_source = self.claude_transcript_path(&home_dir, session_id);
-        let transcript_destination = snapshot_path
+        let transcript_destination = destination_root
             .join(CLAUDE_PROJECTS_DIR_NAME)
             .join(Self::claude_project_key(&self.repo_root))
             .join(format!("{session_id}.jsonl"));
@@ -888,7 +1176,7 @@ impl DaedalusStore {
         }
 
         let file_history_source = self.claude_file_history_path(&home_dir, session_id);
-        let file_history_destination = snapshot_path
+        let file_history_destination = destination_root
             .join(CLAUDE_FILE_HISTORY_DIR_NAME)
             .join(session_id);
         if file_history_source.exists() {
@@ -896,7 +1184,21 @@ impl DaedalusStore {
             captured_any = true;
         }
 
-        if captured_any {
+        if !captured_any {
+            fs::remove_dir_all(destination_root)?;
+        }
+
+        Ok(captured_any)
+    }
+
+    fn snapshot_claude_local_state(
+        &self,
+        run_id: &str,
+        checkpoint_id: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let snapshot_path = self.claude_checkpoint_state_path(run_id, checkpoint_id);
+        if self.snapshot_claude_local_state_to(&snapshot_path, session_id)? {
             Ok(Some(
                 self.claude_checkpoint_state_path(run_id, checkpoint_id)
                     .strip_prefix(&self.state_dir)
@@ -905,7 +1207,6 @@ impl DaedalusStore {
                     .to_string(),
             ))
         } else {
-            fs::remove_dir_all(&snapshot_path)?;
             Ok(None)
         }
     }
@@ -1101,6 +1402,174 @@ impl DaedalusStore {
         ))
     }
 
+    fn rewind_has_diverged(
+        &self,
+        checkpoint: &CheckpointRecord,
+        provisional_rewind_id: &str,
+    ) -> Result<bool> {
+        if !self.list_provisional_checkpoints(provisional_rewind_id)?.is_empty() {
+            return Ok(true);
+        }
+
+        let workspace_matches = self.workspace_matches_checkpoint(checkpoint)?;
+        if !workspace_matches {
+            return Ok(true);
+        }
+
+        if checkpoint.runtime_name.as_deref() == Some("claude") {
+            return self.claude_state_matches_checkpoint(checkpoint).map(|matches| !matches);
+        }
+
+        Ok(false)
+    }
+
+    fn workspace_matches_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<bool> {
+        Ok(self.diff_workspace(&checkpoint.id)?.trim().is_empty())
+    }
+
+    fn claude_state_matches_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<bool> {
+        let Some(session_id) = checkpoint
+            .claude_session_id
+            .as_deref()
+            .filter(|value| Self::is_valid_claude_session_id(value))
+        else {
+            return Ok(true);
+        };
+        let Some(relative) = checkpoint.claude_rewind_rel_path.as_deref() else {
+            return Ok(true);
+        };
+        let Some(home_dir) = Self::claude_home_dir() else {
+            return Ok(true);
+        };
+
+        let snapshot_root = self.state_dir.join(relative);
+        let transcript_snapshot = snapshot_root
+            .join(CLAUDE_PROJECTS_DIR_NAME)
+            .join(Self::claude_project_key(&self.repo_root))
+            .join(format!("{session_id}.jsonl"));
+        let transcript_live = self.claude_transcript_path(&home_dir, session_id);
+        if !paths_match(&transcript_snapshot, &transcript_live)? {
+            return Ok(false);
+        }
+
+        let history_snapshot = snapshot_root
+            .join(CLAUDE_FILE_HISTORY_DIR_NAME)
+            .join(session_id);
+        let history_live = self.claude_file_history_path(&home_dir, session_id);
+        paths_match(&history_snapshot, &history_live)
+    }
+
+    fn materialize_provisional_rewind(
+        &self,
+        provisional_rewind_id: &str,
+        run_id: &str,
+        timeline_id: &str,
+    ) -> Result<()> {
+        let provisional_checkpoints = self.list_provisional_checkpoints(provisional_rewind_id)?;
+        let mut run = self.read_run(run_id)?;
+
+        for provisional in provisional_checkpoints {
+            let snapshot_path = self.provisional_snapshot_path(provisional_rewind_id, &provisional.id);
+            let snapshot_rel_path = format!("{SNAPSHOT_DIR_NAME}/{}", provisional.id);
+            let final_snapshot_path = self.snapshot_path(&snapshot_rel_path);
+            if final_snapshot_path.exists() {
+                fs::remove_dir_all(&final_snapshot_path)?;
+            }
+            move_path(&snapshot_path, &final_snapshot_path)?;
+
+            run_command(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.shadow_dir)
+                    .arg("add")
+                    .arg(&snapshot_rel_path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped()),
+                "git add",
+            )?;
+
+            run_command(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.shadow_dir)
+                    .arg("commit")
+                    .arg("-m")
+                    .arg(format!("checkpoint {}", provisional.id))
+                    .arg("--allow-empty")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped()),
+                "git commit",
+            )?;
+
+            let shadow_commit = read_git_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&self.shadow_dir)
+                    .arg("rev-parse")
+                    .arg("HEAD"),
+                "git rev-parse",
+            )?;
+
+            let claude_rewind_rel_path = {
+                let provisional_path =
+                    self.provisional_claude_state_path(provisional_rewind_id, &provisional.id);
+                if provisional_path.exists() {
+                    let final_path = self.claude_checkpoint_state_path(run_id, &provisional.id);
+                    if final_path.exists() {
+                        fs::remove_dir_all(&final_path)?;
+                    }
+                    move_path(&provisional_path, &final_path)?;
+                    Some(
+                        final_path
+                            .strip_prefix(&self.state_dir)
+                            .unwrap_or(&final_path)
+                            .display()
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            };
+
+            let checkpoint = CheckpointRecord {
+                id: provisional.id.clone(),
+                timeline_id: timeline_id.to_string(),
+                run_id: run_id.to_string(),
+                kind: CheckpointKind::ProtectedAction,
+                parent_checkpoint_id: run.last_checkpoint_id.clone(),
+                reason: provisional.reason,
+                snapshot_rel_path,
+                shadow_commit,
+                created_at: provisional.created_at,
+                resumability: self.compute_checkpoint_resumability(
+                    &final_snapshot_path,
+                    provisional.runtime_name.as_deref(),
+                    provisional.claude_session_id.as_deref(),
+                    claude_rewind_rel_path.as_deref(),
+                ),
+                trigger_tool_type: provisional.trigger_tool_type,
+                trigger_command: provisional.trigger_command,
+                runtime_name: provisional.runtime_name,
+                claude_session_id: provisional.claude_session_id,
+                claude_rewind_rel_path,
+                fingerprint: provisional.fingerprint,
+            };
+            self.write_checkpoint(&checkpoint)?;
+            run.last_checkpoint_id = Some(checkpoint.id.clone());
+            self.write_run(&run)?;
+        }
+
+        self.cleanup_provisional_rewind(provisional_rewind_id)
+    }
+
+    fn cleanup_provisional_rewind(&self, provisional_rewind_id: &str) -> Result<()> {
+        remove_path(&self.provisional_rewind_root(provisional_rewind_id))
+    }
+
+    fn cleanup_runtime_wrapper(&self, run_id: &str) -> Result<()> {
+        remove_path(&self.state_dir.join("runtime").join(run_id))
+    }
+
     fn runtime_for_run(&self, run_id: &str) -> Option<SupportedRuntime> {
         self.read_run(run_id)
             .ok()
@@ -1251,6 +1720,19 @@ fn copy_path(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn move_path(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            copy_path(source, destination)?;
+            remove_path(source)
+        }
+    }
+}
+
 fn remove_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -1278,6 +1760,41 @@ fn path_has_entries(path: &Path) -> bool {
         .ok()
         .and_then(|mut entries| entries.next())
         .is_some()
+}
+
+fn paths_match(expected: &Path, actual: &Path) -> Result<bool> {
+    if !expected.exists() || !actual.exists() {
+        return Ok(!expected.exists() && !actual.exists());
+    }
+
+    let expected_metadata = fs::symlink_metadata(expected)?;
+    let actual_metadata = fs::symlink_metadata(actual)?;
+
+    if expected_metadata.is_dir() != actual_metadata.is_dir() {
+        return Ok(false);
+    }
+
+    if expected_metadata.is_dir() {
+        let mut expected_entries = fs::read_dir(expected)?
+            .map(|entry| entry.map(|item| item.file_name()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut actual_entries = fs::read_dir(actual)?
+            .map(|entry| entry.map(|item| item.file_name()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        expected_entries.sort();
+        actual_entries.sort();
+        if expected_entries != actual_entries {
+            return Ok(false);
+        }
+        for name in expected_entries {
+            if !paths_match(&expected.join(&name), &actual.join(&name))? {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
+
+    Ok(fs::read(expected)? == fs::read(actual)?)
 }
 
 fn run_command(command: &mut Command, label: &str) -> Result<()> {
@@ -2182,6 +2699,228 @@ mod tests {
         fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
+    #[test]
+    fn rewind_creates_a_new_session_with_source_provenance() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("rewind-new-session");
+        let home_dir = create_temp_home("rewind-new-session");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = home_dir.join("rewind-new-session-args.txt");
+        let transcript_seen_path = home_dir.join("rewind-new-session-transcript.txt");
+        let history_seen_path = home_dir.join("rewind-new-session-history.txt");
+        let session_id = "55555555-5555-4555-8555-555555555555".to_string();
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"session head\"}\n",
+            &[("saved.txt", "session head history\n")],
+        );
+        let command = vec![
+            create_fake_claude_resume_script_with_transcript_append(
+                &repo_root,
+                "claude",
+                &args_path,
+                &transcript_seen_path,
+                &history_seen_path,
+                &home_dir,
+                store.repo_root(),
+                &session_id,
+            ),
+            "--print".to_string(),
+            "fresh prompt".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::SessionHead,
+                "session-head".to_string(),
+                super::CheckpointTriggerMetadata {
+                    runtime_name: Some("claude".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create session head checkpoint");
+        store
+            .write_run(&RunRecord {
+                id: run_id.clone(),
+                timeline_id: timeline_id.clone(),
+                command: vec![
+                    repo_root.join("claude").display().to_string(),
+                    "--print".to_string(),
+                    "fresh prompt".to_string(),
+                ],
+                created_at: super::unix_timestamp(),
+                status: RunStatus::Succeeded,
+                last_checkpoint_id: None,
+                head_checkpoint_id: Some(checkpoint.id.clone()),
+                rewind_source_checkpoint_id: None,
+                resumability: Resumability::Full,
+            })
+            .expect("write completed source run");
+
+        let exit_code = store
+            .rewind(&checkpoint.id)
+            .expect("rewind should create a new session");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
+
+        assert_eq!(exit_code, 0);
+        let timelines = store.list_timelines().expect("list timelines");
+        assert_eq!(timelines.len(), 2);
+        let original_run = store.read_run(&run_id).expect("read original run");
+        assert_eq!(original_run.status, RunStatus::Succeeded);
+        assert_eq!(
+            original_run.head_checkpoint_id.as_deref(),
+            Some(checkpoint.id.as_str())
+        );
+
+        let continuation_timeline = timelines
+            .iter()
+            .find(|item| item.id != timeline_id)
+            .expect("continuation timeline");
+        let continuation_run = store
+            .read_run(&continuation_timeline.run_id)
+            .expect("read continuation run");
+        assert_eq!(
+            continuation_run.rewind_source_checkpoint_id.as_deref(),
+            Some(checkpoint.id.as_str())
+        );
+        assert!(continuation_run.head_checkpoint_id.is_some());
+
+        let continuation_checkpoints = store
+            .list_checkpoints()
+            .expect("list checkpoints")
+            .into_iter()
+            .filter(|item| item.timeline_id == continuation_timeline.id)
+            .collect::<Vec<_>>();
+        assert_eq!(continuation_checkpoints.len(), 1);
+        assert_eq!(continuation_checkpoints[0].kind, CheckpointKind::SessionHead);
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
+    }
+
+    #[test]
+    fn rewind_without_divergence_does_not_create_new_session() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("rewind-no-divergence");
+        let home_dir = create_temp_home("rewind-no-divergence");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = home_dir.join("rewind-no-divergence-args.txt");
+        let transcript_seen_path = home_dir.join("rewind-no-divergence-transcript.txt");
+        let history_seen_path = home_dir.join("rewind-no-divergence-history.txt");
+        let session_id = "66666666-6666-4666-8666-666666666666".to_string();
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"session head\"}\n",
+            &[("saved.txt", "session head history\n")],
+        );
+        let command = vec![
+            create_fake_claude_resume_script(
+                &repo_root,
+                "claude",
+                &args_path,
+                &transcript_seen_path,
+                &history_seen_path,
+                &home_dir,
+                store.repo_root(),
+                &session_id,
+            ),
+            "--print".to_string(),
+            "fresh prompt".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::SessionHead,
+                "session-head".to_string(),
+                super::CheckpointTriggerMetadata {
+                    runtime_name: Some("claude".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create session head checkpoint");
+        store
+            .write_run(&RunRecord {
+                id: run_id.clone(),
+                timeline_id: timeline_id.clone(),
+                command: vec![
+                    repo_root.join("claude").display().to_string(),
+                    "--print".to_string(),
+                    "fresh prompt".to_string(),
+                ],
+                created_at: super::unix_timestamp(),
+                status: RunStatus::Succeeded,
+                last_checkpoint_id: None,
+                head_checkpoint_id: Some(checkpoint.id.clone()),
+                rewind_source_checkpoint_id: None,
+                resumability: Resumability::Full,
+            })
+            .expect("write completed source run");
+
+        let exit_code = store
+            .rewind(&checkpoint.id)
+            .expect("rewind should not materialize a session");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
+
+        assert_eq!(exit_code, 0);
+        let timelines = store.list_timelines().expect("list timelines");
+        assert_eq!(timelines.len(), 1);
+        let checkpoints = store.list_checkpoints().expect("list checkpoints");
+        assert_eq!(checkpoints.len(), 1);
+        let original_run = store.read_run(&run_id).expect("read original run");
+        assert_eq!(original_run.status, RunStatus::Succeeded);
+        assert_eq!(
+            original_run.head_checkpoint_id.as_deref(),
+            Some(checkpoint.id.as_str())
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
+    }
+
     fn create_temp_repo(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "ddl-store-test-{name}-{}",
@@ -2239,6 +2978,7 @@ mod tests {
                 status: RunStatus::Running,
                 last_checkpoint_id: None,
                 head_checkpoint_id: None,
+                rewind_source_checkpoint_id: None,
                 resumability,
             })
             .expect("write run");
@@ -2285,6 +3025,40 @@ mod tests {
             args_output.display(),
             transcript_path.display(),
             transcript_output.display(),
+            file_history_path.display(),
+            file_history_path.display(),
+            history_output.display(),
+            history_output.display(),
+        )
+        .expect("write script");
+        let mut permissions = fs::metadata(&path).expect("stat script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod script");
+        path.display().to_string()
+    }
+
+    fn create_fake_claude_resume_script_with_transcript_append(
+        repo_root: &Path,
+        name: &str,
+        args_output: &Path,
+        transcript_output: &Path,
+        history_output: &Path,
+        home_dir: &Path,
+        repo_root_for_project: &Path,
+        session_id: &str,
+    ) -> String {
+        let path = repo_root.join(name);
+        let transcript_path =
+            claude_transcript_path_for_test(home_dir, repo_root_for_project, session_id);
+        let file_history_path = claude_file_history_path_for_test(home_dir, session_id);
+        let mut file = fs::File::create(&path).expect("create script");
+        writeln!(
+            file,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat '{}' > '{}'\nprintf '%s\\n' '{{\"type\":\"user\",\"text\":\"continued\"}}' >> '{}'\nif [ -d '{}' ]; then ls -1 '{}' | sort > '{}'; else : > '{}'; fi\n",
+            args_output.display(),
+            transcript_path.display(),
+            transcript_output.display(),
+            transcript_path.display(),
             file_history_path.display(),
             file_history_path.display(),
             history_output.display(),
