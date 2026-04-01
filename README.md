@@ -1,26 +1,10 @@
 # daedalus
 
-Rewind the repo before Claude broke it.
+Version control for vibe coders.
 
-Git owns history. `daedalus` protects the live run.
+Git owns history. `daedalus` protects both context and repo.
 
-```text
-┌──────────────────── DAEDALUS FLIGHT RECORDER ────────────────────┐
-│ repo: ~/work/app                                                 │
-│ run:  claude                                                     │
-│ mode: protected                                                  │
-├───────────────────────────────────────────────────────────────────┤
-│ t-12s   checkpoint   before Edit(src/auth.rs)                    │
-│ t-08s   checkpoint   before Bash(npm install)                    │
-│ t-03s   checkpoint   before Bash(rm -rf tmp)                     │
-│ t+00s   impact       workspace integrity compromised             │
-│                                                                   │
-│                    LAST SAFE POINT FOUND                         │
-│                                                                   │
-│                  ddl restore        ddl rewind                   │
-│                 workspace only   workspace + Claude context      │
-└───────────────────────────────────────────────────────────────────┘
-```
+<img width="1111" height="663" alt="Screenshot 2026-04-01 at 19 40 08" src="https://github.com/user-attachments/assets/3a62120e-504c-49d9-b390-04ae73b16af1" />
 
 `daedalus` checkpoints a Claude run before risky actions, then gives you two clean recovery moves:
 
