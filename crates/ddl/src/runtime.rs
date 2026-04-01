@@ -10,6 +10,8 @@ pub const ENV_RUN_ID: &str = "DAEDALUS_RUN_ID";
 pub const ENV_TIMELINE_ID: &str = "DAEDALUS_TIMELINE_ID";
 pub const ENV_RUNTIME: &str = "DAEDALUS_RUNTIME";
 pub const ENV_REAL_SHELL: &str = "DAEDALUS_REAL_SHELL";
+pub const ENV_CLAUDE_SESSION_ID: &str = "DAEDALUS_CLAUDE_SESSION_ID";
+pub const ENV_PROVISIONAL_REWIND_ID: &str = "DAEDALUS_PROVISIONAL_REWIND_ID";
 const CLAUDE_PRE_TOOL_USE_HOOK_NAME: &str = "claude-pre-tool-use";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +49,7 @@ pub struct ShellWrapperContext {
     pub timeline_id: String,
     pub runtime: SupportedRuntime,
     pub claude_session_id: Option<String>,
+    pub provisional_rewind_id: Option<String>,
 }
 
 pub fn apply_runtime_environment(
@@ -74,6 +77,12 @@ pub fn apply_runtime_environment(
     command.env(ENV_RUN_ID, &context.run_id);
     command.env(ENV_TIMELINE_ID, &context.timeline_id);
     command.env(ENV_RUNTIME, context.runtime.as_str());
+    if let Some(session_id) = &context.claude_session_id {
+        command.env(ENV_CLAUDE_SESSION_ID, session_id);
+    }
+    if let Some(rewind_id) = &context.provisional_rewind_id {
+        command.env(ENV_PROVISIONAL_REWIND_ID, rewind_id);
+    }
     Ok(())
 }
 
@@ -97,7 +106,8 @@ pub fn current_shell_context() -> Option<ShellWrapperContext> {
         run_id,
         timeline_id,
         runtime,
-        claude_session_id: None,
+        claude_session_id: env::var(ENV_CLAUDE_SESSION_ID).ok(),
+        provisional_rewind_id: env::var(ENV_PROVISIONAL_REWIND_ID).ok(),
     })
 }
 
@@ -256,6 +266,7 @@ mod tests {
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Claude,
                 claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
+                provisional_rewind_id: None,
             },
         )
         .expect("prepare command");
@@ -296,6 +307,7 @@ mod tests {
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Claude,
                 claude_session_id: Some("22222222-2222-4222-8222-222222222222".to_string()),
+                provisional_rewind_id: None,
             },
         )
         .expect("prepare command");
@@ -328,6 +340,7 @@ mod tests {
                 timeline_id: "tl_test".to_string(),
                 runtime: SupportedRuntime::Claude,
                 claude_session_id: None,
+                provisional_rewind_id: None,
             },
         )
         .expect_err("reject bare");
