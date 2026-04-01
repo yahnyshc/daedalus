@@ -10,7 +10,7 @@ use crate::error::{DdlError, Result};
 use crate::ids::next_id;
 use crate::model::{
     CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
-    RuntimeMetadataRecord, TimelineRecord,
+    RuntimeMetadataRecord, StateMetadataRecord, TimelineRecord,
 };
 use crate::runtime::{
     ENV_REAL_SHELL, ShellWrapperContext, SupportedRuntime, apply_runtime_environment,
@@ -19,6 +19,7 @@ use crate::runtime::{
 use uuid::Uuid;
 
 const STATE_DIR: &str = ".daedalus";
+const STATE_METADATA_FILE_NAME: &str = "store.meta";
 const SNAPSHOT_DIR_NAME: &str = "snapshots";
 const LEGACY_CONFIG_FILE_NAME: &str = "config";
 const PRESERVED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
@@ -84,9 +85,37 @@ impl DaedalusStore {
     }
 
     pub fn discover_from(cwd: &Path) -> Result<Self> {
-        let repo_root = resolve_repo_root(cwd)?;
-        let state_dir = repo_root.join(STATE_DIR);
-        Ok(Self {
+        if let Ok(repo_root) = resolve_repo_root(cwd) {
+            let state_dir = repo_root.join(STATE_DIR);
+            return Ok(Self::from_parts(repo_root, state_dir));
+        }
+
+        if let Some(state_dir) = find_state_dir(cwd) {
+            let fallback_repo_root =
+                state_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+                    DdlError::InvalidState("invalid daedalus state directory".to_string())
+                })?;
+            let repo_root = match read_state_metadata_if_present(&state_dir)? {
+                Some(metadata) => {
+                    let stored_repo_root = PathBuf::from(metadata.repo_root);
+                    if stored_repo_root.join(STATE_DIR) == state_dir {
+                        stored_repo_root
+                    } else {
+                        fallback_repo_root.clone()
+                    }
+                }
+                None => fallback_repo_root.clone(),
+            };
+            return Ok(Self::from_parts(repo_root, state_dir));
+        }
+
+        Err(DdlError::InvalidInput(
+            "daedalus must run inside a git repository".to_string(),
+        ))
+    }
+
+    fn from_parts(repo_root: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
             repo_root,
             runs_dir: state_dir.join("runs"),
             timelines_dir: state_dir.join("timelines"),
@@ -96,7 +125,7 @@ impl DaedalusStore {
             shadow_dir: state_dir.join("shadow"),
             snapshots_dir: state_dir.join("shadow").join(SNAPSHOT_DIR_NAME),
             state_dir,
-        })
+        }
     }
 
     pub fn repo_root(&self) -> &Path {
@@ -110,6 +139,9 @@ impl DaedalusStore {
         fs::create_dir_all(&self.transcripts_dir)?;
         fs::create_dir_all(&self.tool_outputs_dir)?;
         fs::create_dir_all(&self.snapshots_dir)?;
+        self.write_state_metadata(&StateMetadataRecord {
+            repo_root: self.repo_root.display().to_string(),
+        })?;
 
         fs::write(self.state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)?;
         let legacy_config = self.state_dir.join(LEGACY_CONFIG_FILE_NAME);
@@ -289,11 +321,9 @@ impl DaedalusStore {
     pub fn rewind(&self, checkpoint_id: &str) -> Result<i32> {
         self.ensure_initialized()?;
         let checkpoint = self.read_checkpoint(checkpoint_id)?;
-        if checkpoint.kind == CheckpointKind::SessionHead
-            && checkpoint.runtime_name.as_deref() != Some("claude")
-        {
+        if checkpoint.runtime_name.as_deref() != Some("claude") {
             return Err(DdlError::InvalidInput(format!(
-                "checkpoint `{checkpoint_id}` is a session head snapshot and cannot be rewound for this runtime; use `ddl restore {checkpoint_id}`"
+                "checkpoint `{checkpoint_id}` is restore-only; use `ddl restore {checkpoint_id}`"
             )));
         }
         if checkpoint.resumability == Resumability::Unavailable {
@@ -510,6 +540,10 @@ impl DaedalusStore {
             fs::create_dir_all(parent)?;
         }
         metadata.write(&path)
+    }
+
+    fn write_state_metadata(&self, metadata: &StateMetadataRecord) -> Result<()> {
+        metadata.write(&self.state_metadata_path())
     }
 
     fn create_standalone_shell_run(&self, command: &[String]) -> Result<StandaloneShellRun> {
@@ -771,7 +805,7 @@ impl DaedalusStore {
                 .arg("rev-parse")
                 .arg("HEAD"),
             "git rev-parse HEAD",
-            "(unborn)",
+            "(unavailable)",
         )?;
         let git_branch = read_git_output_or_default(
             Command::new("git")
@@ -781,17 +815,22 @@ impl DaedalusStore {
                 .arg("--abbrev-ref")
                 .arg("HEAD"),
             "git rev-parse --abbrev-ref HEAD",
-            "(detached)",
+            "(unavailable)",
         )?;
-        let dirty_status = read_git_output(
+        let dirty_status = read_git_output_or_default(
             Command::new("git")
                 .arg("-C")
                 .arg(&self.repo_root)
                 .arg("status")
                 .arg("--porcelain"),
             "git status --porcelain",
+            "",
         )?;
-        let git_version = read_git_output(Command::new("git").arg("--version"), "git --version")?;
+        let git_version = read_git_output_or_default(
+            Command::new("git").arg("--version"),
+            "git --version",
+            "(unavailable)",
+        )?;
 
         Ok(RuntimeFingerprint {
             cwd: std::env::current_dir()?.display().to_string(),
@@ -812,6 +851,10 @@ impl DaedalusStore {
             .join("runtime")
             .join(run_id)
             .join("session.meta")
+    }
+
+    fn state_metadata_path(&self) -> PathBuf {
+        self.state_dir.join(STATE_METADATA_FILE_NAME)
     }
 
     fn claude_checkpoint_state_path(&self, run_id: &str, checkpoint_id: &str) -> PathBuf {
@@ -1185,6 +1228,24 @@ fn resolve_repo_root(cwd: &Path) -> Result<PathBuf> {
     }
 }
 
+fn find_state_dir(cwd: &Path) -> Option<PathBuf> {
+    for ancestor in cwd.ancestors() {
+        let candidate = ancestor.join(STATE_DIR);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn read_state_metadata_if_present(state_dir: &Path) -> Result<Option<StateMetadataRecord>> {
+    let path = state_dir.join(STATE_METADATA_FILE_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(StateMetadataRecord::read(&path)?))
+}
+
 fn list_meta_files(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -1364,10 +1425,120 @@ mod tests {
         assert!(repo_root.join(".daedalus").exists());
         assert!(repo_root.join(".daedalus/shadow/.git").exists());
         assert!(repo_root.join(".daedalus/checkpoints").exists());
+        assert!(repo_root.join(".daedalus/store.meta").exists());
         assert_eq!(
             fs::read_to_string(repo_root.join(".daedalus").join(CONFIG_FILE_NAME))
                 .expect("read config"),
             DEFAULT_CONFIG_JSON
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_uses_daedalus_without_live_git() {
+        let repo_root = create_temp_repo("discover-without-git");
+        let nested = repo_root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested dir");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::remove_dir_all(repo_root.join(".git")).expect("remove live git dir");
+
+        let discovered = DaedalusStore::discover_from(&nested).expect("discover from nested dir");
+        assert_eq!(discovered.repo_root(), repo_root.as_path());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_prefers_active_nested_git_repo() {
+        let _guard = lock_tests();
+        let outer_repo = create_temp_repo("discover-outer");
+        let inner_repo = outer_repo.join("inner");
+        fs::create_dir_all(&inner_repo).expect("create inner dir");
+
+        let outer_store = DaedalusStore::discover_from(&outer_repo).expect("discover outer store");
+        outer_store.init().expect("initialize outer store");
+        Command::new("git")
+            .arg("init")
+            .arg(&inner_repo)
+            .output()
+            .expect("git init inner repo");
+
+        let discovered = DaedalusStore::discover_from(&inner_repo).expect("discover inner store");
+        assert_eq!(
+            discovered.repo_root().canonicalize().expect("canonical repo root"),
+            inner_repo.canonicalize().expect("canonical inner repo")
+        );
+
+        fs::remove_dir_all(outer_repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_creates_state_for_active_nested_git_repo() {
+        let _guard = lock_tests();
+        let outer_repo = create_temp_repo("init-outer");
+        let inner_repo = outer_repo.join("inner");
+        fs::create_dir_all(&inner_repo).expect("create inner dir");
+
+        let outer_store = DaedalusStore::discover_from(&outer_repo).expect("discover outer store");
+        outer_store.init().expect("initialize outer store");
+        Command::new("git")
+            .arg("init")
+            .arg(&inner_repo)
+            .output()
+            .expect("git init inner repo");
+
+        let inner_store = DaedalusStore::discover_from(&inner_repo).expect("discover inner store");
+        inner_store.init().expect("initialize inner store");
+
+        assert!(outer_repo.join(".daedalus/store.meta").exists());
+        assert!(inner_repo.join(".daedalus/store.meta").exists());
+        assert!(inner_repo.join(".daedalus/shadow/.git").exists());
+
+        fs::remove_dir_all(outer_repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn shell_command_can_delete_git_and_restore_workspace_files() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("shell-delete-git");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::write(repo_root.join("test.txt"), "hello").expect("seed file");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let exit_code = store
+            .run_shell_command(vec![
+                "rm".to_string(),
+                "-rf".to_string(),
+                ".git".to_string(),
+                "test.txt".to_string(),
+            ])
+            .expect("run shell");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert_eq!(exit_code, 0);
+        assert!(!repo_root.join(".git").exists());
+        assert!(!repo_root.join("test.txt").exists());
+
+        let recovered = DaedalusStore::discover_from(&repo_root).expect("discover without git");
+        let checkpoints = recovered.list_checkpoints().expect("list checkpoints");
+        let checkpoint = checkpoints
+            .iter()
+            .find(|item| item.kind == CheckpointKind::ProtectedAction)
+            .expect("protected checkpoint");
+        recovered
+            .restore(&checkpoint.id)
+            .expect("restore workspace");
+
+        assert!(!repo_root.join(".git").exists());
+        assert_eq!(
+            fs::read_to_string(repo_root.join("test.txt")).expect("read restored file"),
+            "hello"
         );
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
@@ -2074,8 +2245,44 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("session head snapshot and cannot be rewound for this runtime")
+                .contains("is restore-only; use `ddl restore")
         );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn standalone_shell_checkpoint_cannot_be_rewound() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("shell-rewind");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::write(repo_root.join("test.txt"), "hello").expect("seed file");
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        store
+            .run_shell_command(vec!["rm".to_string(), "test.txt".to_string()])
+            .expect("run shell");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        let checkpoint = store
+            .list_checkpoints()
+            .expect("list checkpoints")
+            .into_iter()
+            .find(|item| item.kind == CheckpointKind::ProtectedAction)
+            .expect("protected checkpoint");
+        let error = store
+            .rewind(&checkpoint.id)
+            .expect_err("standalone shell checkpoint should not rewind");
+
+        assert!(
+            error
+                .to_string()
+                .contains("is restore-only; use `ddl restore")
+        );
+        assert!(!repo_root.join("test.txt").exists());
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }

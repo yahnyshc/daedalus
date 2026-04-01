@@ -210,6 +210,25 @@ impl RuntimeMetadataRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StateMetadataRecord {
+    pub repo_root: String,
+}
+
+impl StateMetadataRecord {
+    pub fn read(path: &Path) -> Result<Self> {
+        let map = read_pairs(path)?;
+        Ok(Self {
+            repo_root: required_value(&map, "repo_root")?,
+        })
+    }
+
+    pub fn write(&self, path: &Path) -> Result<()> {
+        let pairs = vec![("repo_root", self.repo_root.clone())];
+        write_pairs(path, &pairs)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckpointRecord {
     pub id: String,
     pub timeline_id: String,

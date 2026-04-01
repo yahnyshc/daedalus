@@ -41,7 +41,8 @@ pub fn recovery_capability(checkpoint: &CheckpointRecord) -> RecoveryCapability 
     ) {
         (_, "unavailable") => RecoveryCapability::Unavailable,
         (Some("claude"), "partial") => RecoveryCapability::RestoreOnly,
-        (_, "full") | (_, "partial") => RecoveryCapability::Rewindable,
+        (Some("claude"), "full") => RecoveryCapability::Rewindable,
+        (_, "full") | (_, "partial") => RecoveryCapability::RestoreOnly,
         _ => RecoveryCapability::Unavailable,
     }
 }
@@ -293,6 +294,16 @@ mod tests {
     fn recovery_capability_maps_partial_claude_to_restore_only() {
         let mut checkpoint = checkpoint(Some("edit"), Some("src/main.rs"));
         checkpoint.resumability = Resumability::Partial;
+        assert_eq!(
+            recovery_capability(&checkpoint),
+            RecoveryCapability::RestoreOnly
+        );
+    }
+
+    #[test]
+    fn recovery_capability_maps_non_claude_checkpoints_to_restore_only() {
+        let mut checkpoint = checkpoint(Some("bash"), Some("rm README.md"));
+        checkpoint.runtime_name = None;
         assert_eq!(
             recovery_capability(&checkpoint),
             RecoveryCapability::RestoreOnly
