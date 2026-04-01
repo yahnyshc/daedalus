@@ -146,6 +146,7 @@ pub struct RunRecord {
     pub status: RunStatus,
     pub last_checkpoint_id: Option<String>,
     pub head_checkpoint_id: Option<String>,
+    pub rewind_source_checkpoint_id: Option<String>,
     pub resumability: Resumability,
 }
 
@@ -160,6 +161,7 @@ impl RunRecord {
             status: RunStatus::parse(&required_value(&map, "status")?)?,
             last_checkpoint_id: optional_value(&map, "last_checkpoint_id"),
             head_checkpoint_id: optional_value(&map, "head_checkpoint_id"),
+            rewind_source_checkpoint_id: optional_value(&map, "rewind_source_checkpoint_id"),
             resumability: Resumability::parse(&required_value(&map, "resumability")?)?,
         })
     }
@@ -177,6 +179,12 @@ impl RunRecord {
         }
         if let Some(head_checkpoint_id) = &self.head_checkpoint_id {
             pairs.push(("head_checkpoint_id", head_checkpoint_id.clone()));
+        }
+        if let Some(rewind_source_checkpoint_id) = &self.rewind_source_checkpoint_id {
+            pairs.push((
+                "rewind_source_checkpoint_id",
+                rewind_source_checkpoint_id.clone(),
+            ));
         }
         for arg in &self.command {
             pairs.push(("arg", arg.clone()));

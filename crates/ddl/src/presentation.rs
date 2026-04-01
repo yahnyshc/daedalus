@@ -116,6 +116,10 @@ pub fn latest_action_label(checkpoint: Option<&CheckpointRecord>) -> String {
         .unwrap_or_else(|| "No protected actions yet".to_string())
 }
 
+pub fn continuation_label(checkpoint: Option<&CheckpointRecord>) -> Option<String> {
+    checkpoint.map(|checkpoint| format!("Continued from {}", tool_event_label(checkpoint)))
+}
+
 pub fn format_relative_time(timestamp: u64) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -6,8 +6,8 @@ use std::io::Read;
 use crate::error::{DdlError, Result};
 use crate::log_ui::{LogUiExit, run_log_ui};
 use crate::presentation::{
-    RecoveryCapability, format_absolute_time, latest_action_label, recovery_capability,
-    session_status_label, session_title, tool_event_label, tool_event_preview,
+    RecoveryCapability, continuation_label, format_absolute_time, latest_action_label,
+    recovery_capability, session_status_label, session_title, tool_event_label, tool_event_preview,
 };
 use crate::store::DaedalusStore;
 
@@ -249,6 +249,10 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
 fn render_log(store: &DaedalusStore) -> Result<String> {
     let timelines = store.list_timelines()?;
     let checkpoints = store.list_checkpoints()?;
+    let checkpoint_by_id = checkpoints
+        .iter()
+        .map(|checkpoint| (checkpoint.id.as_str(), checkpoint))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut output = String::new();
 
     if timelines.is_empty() {
@@ -275,11 +279,22 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
             .copied()
             .filter(|checkpoint| checkpoint.kind == crate::model::CheckpointKind::ProtectedAction)
             .collect::<Vec<_>>();
+        let mut recovery_points = Vec::new();
+        if let Some(head) = session_head {
+            recovery_points.push(head);
+        }
+        recovery_points.extend(protected_actions.iter().rev().copied());
         let latest_checkpoint = protected_actions.last().copied();
-        let capability = latest_checkpoint
+        let capability = recovery_points
+            .first()
+            .copied()
             .map(recovery_capability)
-            .or_else(|| session_head.map(recovery_capability))
             .unwrap_or(RecoveryCapability::Unavailable);
+        let continuation = continuation_label(
+            run.rewind_source_checkpoint_id
+                .as_deref()
+                .and_then(|checkpoint_id| checkpoint_by_id.get(checkpoint_id).copied()),
+        );
 
         let _ = writeln!(output, "{}", session_title(&timeline, &run));
         let _ = writeln!(
@@ -295,34 +310,17 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
             session_status_label(&run.status),
             latest_checkpoint
                 .map(|item| latest_action_label(Some(item)))
-                .unwrap_or_else(|| {
-                    if session_head.is_some() {
-                        "Session head available".to_string()
-                    } else {
-                        latest_action_label(None)
-                    }
-                })
+                .unwrap_or_else(|| latest_action_label(None),)
         );
-
-        if let Some(head) = session_head {
-            let _ = writeln!(
-                output,
-                "  Session head: {}  |  {}",
-                tool_event_label(head),
-                recovery_capability(head).label()
-            );
-            let _ = writeln!(
-                output,
-                "    Ended: {}",
-                format_absolute_time(head.created_at)
-            );
+        if let Some(continuation) = continuation {
+            let _ = writeln!(output, "  {continuation}");
         }
 
-        if protected_actions.is_empty() {
-            output.push_str("  No protected actions recorded yet.\n");
+        if recovery_points.is_empty() {
+            output.push_str("  No recovery points recorded yet.\n");
         } else {
-            output.push_str("  Protected actions:\n");
-            for checkpoint in protected_actions.into_iter().rev() {
+            output.push_str("  Recovery points:\n");
+            for checkpoint in recovery_points {
                 let _ = writeln!(
                     output,
                     "    {}  |  {}  |  {}",
@@ -394,6 +392,7 @@ mod tests {
             status: RunStatus::Running,
             last_checkpoint_id: Some("cp_test".to_string()),
             head_checkpoint_id: Some("cp_head".to_string()),
+            rewind_source_checkpoint_id: None,
             resumability: Resumability::Full,
         }
         .write(&repo_root.join(".daedalus/runs/run_test.meta"))
@@ -464,7 +463,9 @@ mod tests {
         assert!(output.contains("Recent Sessions"));
         assert!(output.contains("Claude session"));
         assert!(output.contains("Status: Active"));
-        assert!(output.contains("Session head: Session Head  |  Rewindable"));
+        assert!(output.contains("Recovery points:"));
+        assert!(output.contains("Session Head"));
+        assert!(output.contains("Rewindable"));
         assert!(output.contains("Edit src/main.rs"));
         assert!(output.contains("Restore only"));
         assert!(output.contains("Latest protected action: Edit src/main.rs"));
