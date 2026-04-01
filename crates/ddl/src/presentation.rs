@@ -2,7 +2,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ToolKind;
-use crate::model::{CheckpointRecord, RunRecord, RunStatus, TimelineRecord};
+use crate::model::{CheckpointKind, CheckpointRecord, RunRecord, RunStatus, TimelineRecord};
 use crate::runtime::SupportedRuntime;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -23,6 +23,18 @@ impl RecoveryCapability {
 }
 
 pub fn recovery_capability(checkpoint: &CheckpointRecord) -> RecoveryCapability {
+    if checkpoint.kind == CheckpointKind::SessionHead {
+        return match (
+            checkpoint.runtime_name.as_deref(),
+            checkpoint.resumability.as_str(),
+        ) {
+            (_, "unavailable") => RecoveryCapability::Unavailable,
+            (Some("claude"), "partial") => RecoveryCapability::RestoreOnly,
+            (Some("claude"), "full") => RecoveryCapability::Rewindable,
+            _ => RecoveryCapability::RestoreOnly,
+        };
+    }
+
     match (
         checkpoint.runtime_name.as_deref(),
         checkpoint.resumability.as_str(),
@@ -64,6 +76,10 @@ pub fn session_status_label(status: &RunStatus) -> &'static str {
 }
 
 pub fn tool_event_label(checkpoint: &CheckpointRecord) -> String {
+    if checkpoint.kind == CheckpointKind::SessionHead {
+        return "Session Head".to_string();
+    }
+
     match (
         checkpoint.trigger_tool_type.as_deref(),
         checkpoint.trigger_command.as_deref(),
@@ -77,6 +93,10 @@ pub fn tool_event_label(checkpoint: &CheckpointRecord) -> String {
 }
 
 pub fn tool_event_preview(checkpoint: &CheckpointRecord) -> Option<String> {
+    if checkpoint.kind == CheckpointKind::SessionHead {
+        return Some("Latest workspace state when the session ended.".to_string());
+    }
+
     let command = checkpoint.trigger_command.as_deref()?.trim();
     if command.is_empty() {
         return None;
@@ -211,7 +231,7 @@ fn parse_tool_kind(value: &str) -> Option<ToolKind> {
 
 #[cfg(test)]
 mod tests {
-    use crate::model::{CheckpointRecord, Resumability, RuntimeFingerprint};
+    use crate::model::{CheckpointKind, CheckpointRecord, Resumability, RuntimeFingerprint};
 
     use super::{
         RecoveryCapability, recovery_capability, session_status_label, tool_event_label,
@@ -223,6 +243,7 @@ mod tests {
             id: "cp_test".to_string(),
             timeline_id: "tl_test".to_string(),
             run_id: "run_test".to_string(),
+            kind: CheckpointKind::ProtectedAction,
             parent_checkpoint_id: None,
             reason: "before-shell".to_string(),
             snapshot_rel_path: "snapshots/cp_test".to_string(),

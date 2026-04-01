@@ -9,7 +9,7 @@ use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON, DaedalusConfig, ToolI
 use crate::error::{DdlError, Result};
 use crate::ids::next_id;
 use crate::model::{
-    CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
+    CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
     RuntimeMetadataRecord, TimelineRecord,
 };
 use crate::runtime::{
@@ -44,6 +44,7 @@ pub struct RunInvocation {
     pub timeline_id: String,
     pub run_id: String,
     pub latest_checkpoint_id: Option<String>,
+    pub head_checkpoint_id: Option<String>,
     pub exit_code: i32,
 }
 
@@ -184,6 +185,7 @@ impl DaedalusStore {
             created_at,
             status: RunStatus::Running,
             last_checkpoint_id: None,
+            head_checkpoint_id: None,
             resumability: self.initial_run_resumability(runtime),
         };
         self.write_run(&run)?;
@@ -203,18 +205,13 @@ impl DaedalusStore {
         };
         let status = self.execute_owned_command(&command, Some(&shell_context))?;
 
-        run = self.read_run(&run_id)?;
-        run.status = if status.success() {
-            RunStatus::Succeeded
-        } else {
-            RunStatus::Failed
-        };
-        self.write_run(&run)?;
+        run = self.finalize_run(&run_id, &status)?;
 
         Ok(RunInvocation {
             timeline_id,
             run_id,
             latest_checkpoint_id: run.last_checkpoint_id,
+            head_checkpoint_id: run.head_checkpoint_id,
             exit_code: status.code().unwrap_or(1),
         })
     }
@@ -259,13 +256,7 @@ impl DaedalusStore {
         let status = self.execute_shell_command(&command, real_shell.as_deref())?;
 
         if let Some(run) = standalone {
-            let mut record = self.read_run(&run.run_id)?;
-            record.status = if status.success() {
-                RunStatus::Succeeded
-            } else {
-                RunStatus::Failed
-            };
-            self.write_run(&record)?;
+            self.finalize_run(&run.run_id, &status)?;
         }
 
         Ok(status.code().unwrap_or(1))
@@ -302,6 +293,13 @@ impl DaedalusStore {
     pub fn rewind(&self, checkpoint_id: &str) -> Result<i32> {
         self.ensure_initialized()?;
         let checkpoint = self.read_checkpoint(checkpoint_id)?;
+        if checkpoint.kind == CheckpointKind::SessionHead
+            && checkpoint.runtime_name.as_deref() != Some("claude")
+        {
+            return Err(DdlError::InvalidInput(format!(
+                "checkpoint `{checkpoint_id}` is a session head snapshot and cannot be rewound for this runtime; use `ddl restore {checkpoint_id}`"
+            )));
+        }
         if checkpoint.resumability == Resumability::Unavailable {
             return Err(DdlError::InvalidInput(format!(
                 "checkpoint `{checkpoint_id}` cannot be rewound: workspace restore is unavailable"
@@ -537,6 +535,7 @@ impl DaedalusStore {
             created_at,
             status: RunStatus::Running,
             last_checkpoint_id: None,
+            head_checkpoint_id: None,
             resumability: Resumability::Full,
         };
         self.write_run(&run)?;
@@ -592,6 +591,7 @@ impl DaedalusStore {
             timeline_id,
             run_id,
             run.last_checkpoint_id.clone(),
+            CheckpointKind::ProtectedAction,
             invocation.reason().to_string(),
             CheckpointTriggerMetadata {
                 tool_type: Some(invocation.tool.to_string()),
@@ -604,6 +604,30 @@ impl DaedalusStore {
         self.write_run(&run)?;
 
         Ok(checkpoint)
+    }
+
+    fn finalize_run(&self, run_id: &str, status: &ExitStatus) -> Result<RunRecord> {
+        let mut run = self.read_run(run_id)?;
+        let head = self.create_session_head_checkpoint(&run)?;
+        run.head_checkpoint_id = Some(head.id.clone());
+        run.status = if status.success() {
+            RunStatus::Succeeded
+        } else {
+            RunStatus::Failed
+        };
+        self.write_run(&run)?;
+        Ok(run)
+    }
+
+    fn create_session_head_checkpoint(&self, run: &RunRecord) -> Result<CheckpointRecord> {
+        self.create_checkpoint_internal(
+            &run.timeline_id,
+            &run.id,
+            run.last_checkpoint_id.clone(),
+            CheckpointKind::SessionHead,
+            "session-head".to_string(),
+            CheckpointTriggerMetadata::default(),
+        )
     }
 
     fn execute_owned_command(
@@ -662,6 +686,7 @@ impl DaedalusStore {
         timeline_id: &str,
         run_id: &str,
         parent_checkpoint_id: Option<String>,
+        kind: CheckpointKind,
         reason: String,
         trigger: CheckpointTriggerMetadata,
     ) -> Result<CheckpointRecord> {
@@ -731,6 +756,7 @@ impl DaedalusStore {
             id: checkpoint_id,
             timeline_id: timeline_id.to_string(),
             run_id: run_id.to_string(),
+            kind,
             parent_checkpoint_id,
             reason,
             snapshot_rel_path,
@@ -1326,7 +1352,9 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON};
-    use crate::model::{Resumability, RunRecord, RunStatus, RuntimeMetadataRecord, TimelineRecord};
+    use crate::model::{
+        CheckpointKind, Resumability, RunRecord, RunStatus, RuntimeMetadataRecord, TimelineRecord,
+    };
     use crate::runtime::{ENV_RUN_ID, ENV_RUNTIME, ENV_TIMELINE_ID};
 
     use super::DaedalusStore;
@@ -1385,13 +1413,21 @@ mod tests {
         assert_eq!(timelines.len(), 1);
 
         let checkpoints = store.list_checkpoints().expect("list checkpoints");
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].timeline_id, timelines[0].id);
-        assert_eq!(checkpoints[0].reason, "before-shell");
-        assert_eq!(
-            checkpoints[0].trigger_command.as_deref(),
-            Some("rm test.txt")
-        );
+        assert_eq!(checkpoints.len(), 2);
+        let protected = checkpoints
+            .iter()
+            .find(|item| item.kind == CheckpointKind::ProtectedAction)
+            .expect("protected checkpoint");
+        let head = checkpoints
+            .iter()
+            .find(|item| item.kind == CheckpointKind::SessionHead)
+            .expect("session head checkpoint");
+        assert_eq!(protected.timeline_id, timelines[0].id);
+        assert_eq!(protected.reason, "before-shell");
+        assert_eq!(protected.trigger_command.as_deref(), Some("rm test.txt"));
+        assert_eq!(head.reason, "session-head");
+        let run = store.read_run(&timelines[0].run_id).expect("read run");
+        assert_eq!(run.head_checkpoint_id.as_deref(), Some(head.id.as_str()));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
@@ -1752,6 +1788,7 @@ mod tests {
                 &timeline_id,
                 &run_id,
                 None,
+                CheckpointKind::ProtectedAction,
                 "before-edit".to_string(),
                 super::CheckpointTriggerMetadata {
                     tool_type: Some("edit".to_string()),
@@ -1831,6 +1868,7 @@ mod tests {
                 &timeline_id,
                 &run_id,
                 None,
+                CheckpointKind::ProtectedAction,
                 "before-edit".to_string(),
                 super::CheckpointTriggerMetadata {
                     tool_type: Some("edit".to_string()),
@@ -1906,6 +1944,7 @@ mod tests {
                 &timeline_id,
                 &run_id,
                 None,
+                CheckpointKind::ProtectedAction,
                 "before-edit".to_string(),
                 super::CheckpointTriggerMetadata {
                     tool_type: Some("edit".to_string()),
@@ -1992,6 +2031,7 @@ mod tests {
                 &timeline_id,
                 &run_id,
                 None,
+                CheckpointKind::ProtectedAction,
                 "before-edit".to_string(),
                 super::CheckpointTriggerMetadata {
                     tool_type: Some("edit".to_string()),
@@ -2042,6 +2082,7 @@ mod tests {
                 &timeline_id,
                 &run_id,
                 None,
+                CheckpointKind::ProtectedAction,
                 "before-shell".to_string(),
                 super::CheckpointTriggerMetadata {
                     tool_type: Some("bash".to_string()),
@@ -2060,6 +2101,131 @@ mod tests {
         assert!(args.contains("keep-me"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn non_claude_session_head_checkpoint_cannot_be_rewound() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("session-head-rewind");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("codex-head-args.txt");
+        let command = vec![create_fake_agent_script(&repo_root, "codex", &args_path)];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+
+        let previous = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::SessionHead,
+                "session-head".to_string(),
+                super::CheckpointTriggerMetadata::default(),
+            )
+            .expect("create session head checkpoint");
+        let error = store
+            .rewind(&checkpoint.id)
+            .expect_err("session head should not rewind");
+        std::env::set_current_dir(previous).expect("restore cwd");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session head snapshot and cannot be rewound for this runtime")
+        );
+        assert!(!args_path.exists());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn claude_session_head_checkpoint_can_be_rewound() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("claude-session-head-rewind");
+        let home_dir = create_temp_home("claude-session-head-rewind");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        let args_path = repo_root.join("claude-head-args.txt");
+        let transcript_seen_path = repo_root.join("claude-head-transcript-seen.txt");
+        let history_seen_path = repo_root.join("claude-head-history-seen.txt");
+        let session_id = "44444444-4444-4444-8444-444444444444".to_string();
+        seed_claude_local_state(
+            &home_dir,
+            store.repo_root(),
+            &session_id,
+            "{\"type\":\"assistant\",\"text\":\"session head\"}\n",
+            &[("saved.txt", "session head history\n")],
+        );
+        let command = vec![
+            create_fake_claude_resume_script(
+                &repo_root,
+                "claude",
+                &args_path,
+                &transcript_seen_path,
+                &history_seen_path,
+                &home_dir,
+                store.repo_root(),
+                &session_id,
+            ),
+            "--print".to_string(),
+            "fresh prompt".to_string(),
+        ];
+        let (run_id, timeline_id) =
+            create_active_run_with_command(&store, command, Resumability::Full);
+        store
+            .write_runtime_metadata(
+                &run_id,
+                &RuntimeMetadataRecord {
+                    runtime_name: "claude".to_string(),
+                    claude_session_id: Some(session_id.clone()),
+                },
+            )
+            .expect("write runtime metadata");
+
+        let previous = std::env::current_dir().expect("current dir");
+        let previous_home = set_home(&home_dir);
+        std::env::set_current_dir(&repo_root).expect("cd temp repo");
+        let checkpoint = store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::SessionHead,
+                "session-head".to_string(),
+                super::CheckpointTriggerMetadata {
+                    runtime_name: Some("claude".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("create session head checkpoint");
+        fs::remove_file(&args_path).ok();
+        let exit_code = store
+            .rewind(&checkpoint.id)
+            .expect("rewind session head checkpoint");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        restore_home(previous_home);
+
+        assert_eq!(exit_code, 0);
+        let args = fs::read_to_string(&args_path).expect("read agent args");
+        assert!(args.contains("--resume"));
+        assert!(args.contains(&session_id));
+        assert!(!args.contains("fresh prompt"));
+        assert_eq!(
+            fs::read_to_string(&transcript_seen_path).expect("read seen transcript"),
+            "{\"type\":\"assistant\",\"text\":\"session head\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&history_seen_path).expect("read seen history"),
+            "saved.txt\n"
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+        fs::remove_dir_all(home_dir).expect("cleanup temp home");
     }
 
     fn create_temp_repo(name: &str) -> PathBuf {
@@ -2118,6 +2284,7 @@ mod tests {
                 created_at,
                 status: RunStatus::Running,
                 last_checkpoint_id: None,
+                head_checkpoint_id: None,
                 resumability,
             })
             .expect("write run");

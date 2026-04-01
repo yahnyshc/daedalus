@@ -70,6 +70,37 @@ impl Display for Resumability {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CheckpointKind {
+    ProtectedAction,
+    SessionHead,
+}
+
+impl CheckpointKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ProtectedAction => "protected_action",
+            Self::SessionHead => "session_head",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "protected_action" => Ok(Self::ProtectedAction),
+            "session_head" => Ok(Self::SessionHead),
+            _ => Err(DdlError::InvalidState(format!(
+                "unknown checkpoint kind `{value}`"
+            ))),
+        }
+    }
+}
+
+impl Display for CheckpointKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFingerprint {
     pub cwd: String,
     pub repo_root: String,
@@ -114,6 +145,7 @@ pub struct RunRecord {
     pub created_at: u64,
     pub status: RunStatus,
     pub last_checkpoint_id: Option<String>,
+    pub head_checkpoint_id: Option<String>,
     pub resumability: Resumability,
 }
 
@@ -127,6 +159,7 @@ impl RunRecord {
             created_at: required_value(&map, "created_at")?.parse()?,
             status: RunStatus::parse(&required_value(&map, "status")?)?,
             last_checkpoint_id: optional_value(&map, "last_checkpoint_id"),
+            head_checkpoint_id: optional_value(&map, "head_checkpoint_id"),
             resumability: Resumability::parse(&required_value(&map, "resumability")?)?,
         })
     }
@@ -141,6 +174,9 @@ impl RunRecord {
         ];
         if let Some(last_checkpoint_id) = &self.last_checkpoint_id {
             pairs.push(("last_checkpoint_id", last_checkpoint_id.clone()));
+        }
+        if let Some(head_checkpoint_id) = &self.head_checkpoint_id {
+            pairs.push(("head_checkpoint_id", head_checkpoint_id.clone()));
         }
         for arg in &self.command {
             pairs.push(("arg", arg.clone()));
@@ -178,6 +214,7 @@ pub struct CheckpointRecord {
     pub id: String,
     pub timeline_id: String,
     pub run_id: String,
+    pub kind: CheckpointKind,
     pub parent_checkpoint_id: Option<String>,
     pub reason: String,
     pub snapshot_rel_path: String,
@@ -195,12 +232,19 @@ pub struct CheckpointRecord {
 impl CheckpointRecord {
     pub fn read(path: &Path) -> Result<Self> {
         let map = read_pairs(path)?;
+        let reason = required_value(&map, "reason")?;
+        let kind = match optional_value(&map, "kind") {
+            Some(value) => CheckpointKind::parse(&value)?,
+            None if reason == "session-head" => CheckpointKind::SessionHead,
+            None => CheckpointKind::ProtectedAction,
+        };
         Ok(Self {
             id: required_value(&map, "id")?,
             timeline_id: required_value(&map, "timeline_id")?,
             run_id: required_value(&map, "run_id")?,
+            kind,
             parent_checkpoint_id: optional_value(&map, "parent_checkpoint_id"),
-            reason: required_value(&map, "reason")?,
+            reason,
             snapshot_rel_path: required_value(&map, "snapshot_rel_path")?,
             shadow_commit: required_value(&map, "shadow_commit")?,
             created_at: required_value(&map, "created_at")?.parse()?,
@@ -226,6 +270,7 @@ impl CheckpointRecord {
             ("id", self.id.clone()),
             ("timeline_id", self.timeline_id.clone()),
             ("run_id", self.run_id.clone()),
+            ("kind", self.kind.as_str().to_string()),
             ("reason", self.reason.clone()),
             ("snapshot_rel_path", self.snapshot_rel_path.clone()),
             ("shadow_commit", self.shadow_commit.clone()),

@@ -33,8 +33,16 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
             let result = store.run_agent(command)?;
             if let Some(checkpoint_id) = result.latest_checkpoint_id {
                 println!(
-                    "run {} finished on timeline {} with latest checkpoint {}",
-                    result.run_id, result.timeline_id, checkpoint_id
+                    "run {} finished on timeline {} with latest checkpoint {} and session head {}",
+                    result.run_id,
+                    result.timeline_id,
+                    checkpoint_id,
+                    result.head_checkpoint_id.as_deref().unwrap_or("(missing)")
+                );
+            } else if let Some(head_checkpoint_id) = result.head_checkpoint_id {
+                println!(
+                    "run {} finished on timeline {} with session head {}",
+                    result.run_id, result.timeline_id, head_checkpoint_id
                 );
             } else {
                 println!(
@@ -251,13 +259,26 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
     output.push_str("Recent Sessions\n");
     for timeline in timelines.into_iter().rev() {
         let run = store.read_run(&timeline.run_id)?;
-        let session_checkpoints = checkpoints
+        let mut session_checkpoints = checkpoints
             .iter()
             .filter(|checkpoint| checkpoint.timeline_id == timeline.id)
             .collect::<Vec<_>>();
-        let latest_checkpoint = session_checkpoints.last().copied();
+        session_checkpoints.sort_by_key(|checkpoint| checkpoint.created_at);
+        let session_head = run.head_checkpoint_id.as_deref().and_then(|head_id| {
+            session_checkpoints
+                .iter()
+                .copied()
+                .find(|item| item.id == head_id)
+        });
+        let protected_actions = session_checkpoints
+            .iter()
+            .copied()
+            .filter(|checkpoint| checkpoint.kind == crate::model::CheckpointKind::ProtectedAction)
+            .collect::<Vec<_>>();
+        let latest_checkpoint = protected_actions.last().copied();
         let capability = latest_checkpoint
             .map(recovery_capability)
+            .or_else(|| session_head.map(recovery_capability))
             .unwrap_or(RecoveryCapability::Unavailable);
 
         let _ = writeln!(output, "{}", session_title(&timeline, &run));
@@ -265,32 +286,53 @@ fn render_log(store: &DaedalusStore) -> Result<String> {
             output,
             "  Started: {}  |  {} protected actions  |  {}",
             format_absolute_time(timeline.created_at),
-            session_checkpoints.len(),
+            protected_actions.len(),
             capability.label()
         );
         let _ = writeln!(
             output,
             "  Status: {}  |  Latest protected action: {}",
             session_status_label(&run.status),
-            latest_action_label(latest_checkpoint)
+            latest_checkpoint
+                .map(|item| latest_action_label(Some(item)))
+                .unwrap_or_else(|| {
+                    if session_head.is_some() {
+                        "Session head available".to_string()
+                    } else {
+                        latest_action_label(None)
+                    }
+                })
         );
 
-        if session_checkpoints.is_empty() {
-            output.push_str("  No protected actions recorded yet.\n");
-            continue;
-        }
-
-        output.push_str("  Protected actions:\n");
-        for checkpoint in session_checkpoints.into_iter().rev() {
+        if let Some(head) = session_head {
             let _ = writeln!(
                 output,
-                "    {}  |  {}  |  {}",
-                tool_event_label(checkpoint),
-                crate::presentation::format_relative_time(checkpoint.created_at),
-                recovery_capability(checkpoint).label()
+                "  Session head: {}  |  {}",
+                tool_event_label(head),
+                recovery_capability(head).label()
             );
-            if let Some(preview) = tool_event_preview(checkpoint) {
-                let _ = writeln!(output, "      {preview}");
+            let _ = writeln!(
+                output,
+                "    Ended: {}",
+                format_absolute_time(head.created_at)
+            );
+        }
+
+        if protected_actions.is_empty() {
+            output.push_str("  No protected actions recorded yet.\n");
+        } else {
+            output.push_str("  Protected actions:\n");
+            for checkpoint in protected_actions.into_iter().rev() {
+                let _ = writeln!(
+                    output,
+                    "    {}  |  {}  |  {}",
+                    tool_event_label(checkpoint),
+                    crate::presentation::format_relative_time(checkpoint.created_at),
+                    recovery_capability(checkpoint).label()
+                );
+                if let Some(preview) = tool_event_preview(checkpoint) {
+                    let _ = writeln!(output, "      {preview}");
+                }
             }
         }
     }
@@ -323,7 +365,8 @@ mod tests {
     use std::process::Command;
 
     use crate::model::{
-        CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint, TimelineRecord,
+        CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
+        TimelineRecord,
     };
     use crate::store::DaedalusStore;
 
@@ -350,12 +393,15 @@ mod tests {
             created_at,
             status: RunStatus::Running,
             last_checkpoint_id: Some("cp_test".to_string()),
+            head_checkpoint_id: Some("cp_head".to_string()),
             resumability: Resumability::Full,
         }
         .write(&repo_root.join(".daedalus/runs/run_test.meta"))
         .expect("write run");
         let snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_test");
         fs::create_dir_all(&snapshot_path).expect("create snapshot");
+        let head_snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_head");
+        fs::create_dir_all(&head_snapshot_path).expect("create head snapshot");
         let rewind_path = repo_root.join(".daedalus/runtime/run_test/claude-checkpoints/cp_full");
         fs::create_dir_all(&rewind_path).expect("create rewind snapshot");
         fs::write(rewind_path.join("marker.txt"), "saved").expect("write rewind marker");
@@ -363,6 +409,7 @@ mod tests {
             id: "cp_test".to_string(),
             timeline_id: "tl_test".to_string(),
             run_id: "run_test".to_string(),
+            kind: CheckpointKind::ProtectedAction,
             parent_checkpoint_id: None,
             reason: "before-edit".to_string(),
             snapshot_rel_path: "snapshots/cp_test".to_string(),
@@ -386,17 +433,18 @@ mod tests {
         .write(&repo_root.join(".daedalus/checkpoints/cp_test.meta"))
         .expect("write checkpoint");
         CheckpointRecord {
-            id: "cp_full".to_string(),
+            id: "cp_head".to_string(),
             timeline_id: "tl_test".to_string(),
             run_id: "run_test".to_string(),
+            kind: CheckpointKind::SessionHead,
             parent_checkpoint_id: Some("cp_test".to_string()),
-            reason: "before-shell".to_string(),
-            snapshot_rel_path: "snapshots/cp_test".to_string(),
+            reason: "session-head".to_string(),
+            snapshot_rel_path: "snapshots/cp_head".to_string(),
             shadow_commit: "cafebabe".to_string(),
             created_at: created_at + 1,
             resumability: Resumability::Full,
-            trigger_tool_type: Some("bash".to_string()),
-            trigger_command: Some("rm README.md".to_string()),
+            trigger_tool_type: None,
+            trigger_command: None,
             runtime_name: Some("claude".to_string()),
             claude_session_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
             claude_rewind_rel_path: Some("runtime/run_test/claude-checkpoints/cp_full".to_string()),
@@ -409,17 +457,17 @@ mod tests {
                 git_version: "git version".to_string(),
             },
         }
-        .write(&repo_root.join(".daedalus/checkpoints/cp_full.meta"))
-        .expect("write full checkpoint");
+        .write(&repo_root.join(".daedalus/checkpoints/cp_head.meta"))
+        .expect("write session head checkpoint");
 
         let output = render_log(&store).expect("render log");
         assert!(output.contains("Recent Sessions"));
         assert!(output.contains("Claude session"));
         assert!(output.contains("Status: Active"));
+        assert!(output.contains("Session head: Session Head  |  Rewindable"));
         assert!(output.contains("Edit src/main.rs"));
         assert!(output.contains("Restore only"));
-        assert!(output.contains("Bash rm README.md"));
-        assert!(output.contains("Rewindable"));
+        assert!(output.contains("Latest protected action: Edit src/main.rs"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }

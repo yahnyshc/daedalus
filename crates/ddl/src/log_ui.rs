@@ -17,7 +17,7 @@ use ratatui::widgets::{
 use ratatui::{Frame, Terminal};
 
 use crate::error::Result;
-use crate::model::{CheckpointRecord, RunRecord, TimelineRecord};
+use crate::model::{CheckpointKind, CheckpointRecord, RunRecord, TimelineRecord};
 use crate::presentation::{
     RecoveryCapability, format_absolute_time, format_relative_time, format_runtime,
     latest_action_label, recovery_capability, session_status_label, session_title,
@@ -105,6 +105,12 @@ enum PendingActionKind {
     Rewind,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryFocus {
+    Head,
+    Actions,
+}
+
 #[derive(Clone)]
 struct PendingAction {
     kind: PendingActionKind,
@@ -115,6 +121,7 @@ struct LogUiApp {
     screen: Screen,
     timelines: Vec<TimelineSummary>,
     timeline_state: ListState,
+    recovery_focus: RecoveryFocus,
     checkpoint_state: ListState,
     file_state: ListState,
     diff_focus: DiffFocus,
@@ -136,6 +143,7 @@ impl LogUiApp {
             screen: Screen::Timelines,
             timelines,
             timeline_state,
+            recovery_focus: RecoveryFocus::Actions,
             checkpoint_state: ListState::default(),
             file_state: ListState::default(),
             diff_focus: DiffFocus::Files,
@@ -214,6 +222,10 @@ impl LogUiApp {
         key: KeyEvent,
         store: &DaedalusStore,
     ) -> Result<Option<LogUiExit>> {
+        let has_head = self
+            .selected_timeline()
+            .and_then(|item| item.head.as_ref())
+            .is_some();
         let checkpoints_len = self
             .selected_timeline()
             .map(|item| item.checkpoints.len())
@@ -227,19 +239,57 @@ impl LogUiApp {
                 Ok(None)
             }
             KeyCode::Down => {
-                move_selection(&mut self.checkpoint_state, checkpoints_len, 1);
+                match self.recovery_focus {
+                    RecoveryFocus::Head if checkpoints_len > 0 => {
+                        self.recovery_focus = RecoveryFocus::Actions;
+                        if self.checkpoint_state.selected().is_none() {
+                            self.checkpoint_state.select(Some(0));
+                        }
+                    }
+                    RecoveryFocus::Actions => {
+                        move_selection(&mut self.checkpoint_state, checkpoints_len, 1);
+                    }
+                    RecoveryFocus::Head => {}
+                }
                 Ok(None)
             }
             KeyCode::Up => {
-                move_selection(&mut self.checkpoint_state, checkpoints_len, -1);
+                match self.recovery_focus {
+                    RecoveryFocus::Actions
+                        if self.checkpoint_state.selected() == Some(0) && has_head =>
+                    {
+                        self.recovery_focus = RecoveryFocus::Head;
+                    }
+                    RecoveryFocus::Actions => {
+                        move_selection(&mut self.checkpoint_state, checkpoints_len, -1);
+                    }
+                    RecoveryFocus::Head => {}
+                }
                 Ok(None)
             }
             KeyCode::PageDown => {
-                move_selection(&mut self.checkpoint_state, checkpoints_len, 8);
+                match self.recovery_focus {
+                    RecoveryFocus::Head if checkpoints_len > 0 => {
+                        self.recovery_focus = RecoveryFocus::Actions;
+                        self.checkpoint_state.select(Some(0));
+                    }
+                    RecoveryFocus::Actions => {
+                        move_selection(&mut self.checkpoint_state, checkpoints_len, 8);
+                    }
+                    RecoveryFocus::Head => {}
+                }
                 Ok(None)
             }
             KeyCode::PageUp => {
-                move_selection(&mut self.checkpoint_state, checkpoints_len, -8);
+                match self.recovery_focus {
+                    RecoveryFocus::Actions if has_head => {
+                        self.recovery_focus = RecoveryFocus::Head;
+                    }
+                    RecoveryFocus::Actions => {
+                        move_selection(&mut self.checkpoint_state, checkpoints_len, -8);
+                    }
+                    RecoveryFocus::Head => {}
+                }
                 Ok(None)
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -414,16 +464,29 @@ impl LogUiApp {
             self.draw_timelines(frame, area);
             return;
         };
-
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(8),
-                Constraint::Length(3),
-            ])
-            .split(area);
-        let row_width = list_row_width(sections[1], LIST_HIGHLIGHT_SYMBOL);
+        let sections = if timeline.head.is_some() {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Length(4),
+                    Constraint::Min(8),
+                    Constraint::Length(3),
+                ])
+                .split(area)
+        } else {
+            Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(5),
+                    Constraint::Min(8),
+                    Constraint::Length(3),
+                ])
+                .split(area)
+        };
+        let actions_section = if timeline.head.is_some() { 2 } else { 1 };
+        let footer_section = if timeline.head.is_some() { 3 } else { 2 };
+        let row_width = list_row_width(sections[actions_section], LIST_HIGHLIGHT_SYMBOL);
 
         let header = Paragraph::new(Text::from(vec![
             Line::from(vec![
@@ -463,6 +526,17 @@ impl LogUiApp {
         );
         frame.render_widget(header, sections[0]);
 
+        if let Some(head) = &timeline.head {
+            frame.render_widget(
+                session_head_panel(
+                    head,
+                    panel_row_width(sections[1]),
+                    self.recovery_focus == RecoveryFocus::Head,
+                ),
+                sections[1],
+            );
+        }
+
         let items = if timeline.checkpoints.is_empty() {
             vec![ListItem::new(Line::from(
                 "No protected actions recorded in this session yet.",
@@ -489,14 +563,14 @@ impl LogUiApp {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
-        frame.render_stateful_widget(list, sections[1], &mut self.checkpoint_state);
+        frame.render_stateful_widget(list, sections[actions_section], &mut self.checkpoint_state);
         frame.render_widget(
             footer_paragraph(
                 "Inspect protected actions before recovering",
                 self.status_message.as_deref(),
-                "[up/down] move  [enter] diff  [r] restore  [w] rewind  [esc] back  [q] quit",
+                "[up/down] move  [enter] diff  [r] restore  [w] rewind action  [esc] back  [q] quit",
             ),
-            sections[2],
+            sections[footer_section],
         );
     }
 
@@ -505,7 +579,7 @@ impl LogUiApp {
             self.draw_timelines(frame, area);
             return;
         };
-        let Some(checkpoint) = self.selected_checkpoint() else {
+        let Some(checkpoint) = self.selected_target() else {
             self.draw_checkpoints(frame, area);
             return;
         };
@@ -635,7 +709,7 @@ impl LogUiApp {
             Line::from(""),
         ];
 
-        if let Some(checkpoint) = self.selected_checkpoint() {
+        if let Some(checkpoint) = self.selected_target() {
             lines.push(Line::from(checkpoint.label.clone()));
         }
 
@@ -669,8 +743,11 @@ impl LogUiApp {
     fn enter_checkpoints(&mut self) {
         self.screen = Screen::Checkpoints;
         self.checkpoint_state = ListState::default();
+        self.recovery_focus = RecoveryFocus::Actions;
         if let Some(timeline) = self.selected_timeline() {
-            if !timeline.checkpoints.is_empty() {
+            if timeline.head.is_some() {
+                self.recovery_focus = RecoveryFocus::Head;
+            } else if !timeline.checkpoints.is_empty() {
                 self.checkpoint_state.select(Some(0));
             }
         }
@@ -678,13 +755,13 @@ impl LogUiApp {
     }
 
     fn enter_diff(&mut self, store: &DaedalusStore) -> Result<()> {
-        if self.selected_checkpoint().is_none() {
+        if self.selected_target().is_none() {
             return Ok(());
         }
 
         self.screen = Screen::Diff;
         self.compare_mode = if self
-            .selected_checkpoint()
+            .selected_target()
             .and_then(|checkpoint| checkpoint.checkpoint.parent_checkpoint_id.as_ref())
             .is_some()
         {
@@ -697,7 +774,7 @@ impl LogUiApp {
     }
 
     fn reload_diff(&mut self, store: &DaedalusStore) -> Result<()> {
-        let Some(checkpoint) = self.selected_checkpoint() else {
+        let Some(checkpoint) = self.selected_target() else {
             return Ok(());
         };
 
@@ -714,7 +791,7 @@ impl LogUiApp {
             .selected_timeline()
             .map(|item| item.timeline.id.clone());
         let selected_checkpoint_id = self
-            .selected_checkpoint()
+            .selected_target()
             .map(|item| item.checkpoint.id.clone());
 
         self.timelines = load_timeline_summaries(store)?;
@@ -730,14 +807,24 @@ impl LogUiApp {
             self.checkpoint_state = ListState::default();
             let selected_timeline_index = self.timeline_state.selected();
             if let Some(index) = selected_timeline_index {
-                let checkpoints = &self.timelines[index].checkpoints;
-                select_by_id(
-                    &mut self.checkpoint_state,
-                    checkpoints,
-                    selected_checkpoint_id.as_deref(),
-                    |item| item.checkpoint.id.as_str(),
-                );
-                if checkpoints.is_empty() {
+                let timeline = &self.timelines[index];
+                if timeline.head.as_ref().is_some_and(|item| {
+                    Some(item.checkpoint.id.as_str()) == selected_checkpoint_id.as_deref()
+                }) {
+                    self.recovery_focus = RecoveryFocus::Head;
+                } else {
+                    self.recovery_focus = RecoveryFocus::Actions;
+                    select_by_id(
+                        &mut self.checkpoint_state,
+                        &timeline.checkpoints,
+                        selected_checkpoint_id.as_deref(),
+                        |item| item.checkpoint.id.as_str(),
+                    );
+                    if self.checkpoint_state.selected().is_none() && timeline.head.is_some() {
+                        self.recovery_focus = RecoveryFocus::Head;
+                    }
+                }
+                if timeline.checkpoints.is_empty() && timeline.head.is_none() {
                     self.screen = Screen::Checkpoints;
                 }
             } else {
@@ -753,7 +840,7 @@ impl LogUiApp {
     }
 
     fn begin_action(&mut self, kind: PendingActionKind) {
-        let Some(checkpoint) = self.selected_checkpoint() else {
+        let Some(checkpoint) = self.selected_target() else {
             return;
         };
 
@@ -837,11 +924,16 @@ impl LogUiApp {
             .and_then(|index| self.timelines.get(index))
     }
 
-    fn selected_checkpoint(&self) -> Option<&CheckpointSummary> {
+    fn selected_target(&self) -> Option<&CheckpointSummary> {
         let timeline = self.selected_timeline()?;
-        self.checkpoint_state
-            .selected()
-            .and_then(|index| timeline.checkpoints.get(index))
+        match self.recovery_focus {
+            RecoveryFocus::Head => timeline.head.as_ref(),
+            RecoveryFocus::Actions => self
+                .checkpoint_state
+                .selected()
+                .and_then(|index| timeline.checkpoints.get(index))
+                .or_else(|| timeline.head.as_ref()),
+        }
     }
 }
 
@@ -851,6 +943,7 @@ struct TimelineSummary {
     run: RunRecord,
     title: String,
     runtime: String,
+    head: Option<CheckpointSummary>,
     checkpoints: Vec<CheckpointSummary>,
     latest_action: String,
     capability: RecoveryCapability,
@@ -907,23 +1000,43 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
         let mut timeline_checkpoints = grouped.remove(&timeline.id).unwrap_or_default();
         timeline_checkpoints.sort_by_key(|item| std::cmp::Reverse(item.created_at));
 
-        let checkpoints = timeline_checkpoints
-            .into_iter()
-            .map(|checkpoint| CheckpointSummary {
+        let mut head = None;
+        let mut checkpoints = Vec::new();
+        for checkpoint in timeline_checkpoints {
+            let summary = CheckpointSummary {
                 label: tool_event_label(&checkpoint),
                 preview: tool_event_preview(&checkpoint),
                 capability: recovery_capability(&checkpoint),
                 checkpoint,
-            })
-            .collect::<Vec<_>>();
+            };
+            if summary.checkpoint.kind == CheckpointKind::SessionHead {
+                let is_selected_head =
+                    run.head_checkpoint_id.as_deref() == Some(summary.checkpoint.id.as_str());
+                if head.is_none() || is_selected_head {
+                    head = Some(summary);
+                }
+            } else {
+                checkpoints.push(summary);
+            }
+        }
 
-        let latest_action = latest_action_label(checkpoints.first().map(|item| &item.checkpoint));
+        let latest_action = if let Some(checkpoint) = checkpoints.first() {
+            latest_action_label(Some(&checkpoint.checkpoint))
+        } else if head.is_some() {
+            "Session head available".to_string()
+        } else {
+            latest_action_label(None)
+        };
         let capability = checkpoints
             .first()
             .map(|item| item.capability)
+            .or_else(|| head.as_ref().map(|item| item.capability))
             .unwrap_or(RecoveryCapability::Unavailable);
         let title = session_title(&timeline, &run);
-        let end_timestamp = checkpoints.first().map(|item| item.checkpoint.created_at);
+        let end_timestamp = head
+            .as_ref()
+            .map(|item| item.checkpoint.created_at)
+            .or_else(|| checkpoints.first().map(|item| item.checkpoint.created_at));
         let runtime = format_runtime(timeline.created_at, end_timestamp);
 
         items.push(TimelineSummary {
@@ -931,6 +1044,7 @@ fn load_timeline_summaries(store: &DaedalusStore) -> Result<Vec<TimelineSummary>
             run,
             title,
             runtime,
+            head,
             checkpoints,
             latest_action,
             capability,
@@ -948,7 +1062,11 @@ fn build_diff_panel(
     let (compare_label, patch) = match compare_mode {
         DiffCompareMode::Parent => match checkpoint.checkpoint.parent_checkpoint_id.as_deref() {
             Some(parent_id) => (
-                "Compared with previous protected action".to_string(),
+                if checkpoint.checkpoint.kind == CheckpointKind::SessionHead {
+                    "Compared with latest protected action".to_string()
+                } else {
+                    "Compared with previous protected action".to_string()
+                },
                 store.diff(parent_id, &checkpoint.checkpoint.id)?,
             ),
             None => (
@@ -1115,6 +1233,29 @@ fn checkpoint_row(checkpoint: &CheckpointSummary, width: usize) -> Text<'static>
     ])
 }
 
+fn session_head_panel(
+    checkpoint: &CheckpointSummary,
+    width: usize,
+    focused: bool,
+) -> Paragraph<'static> {
+    let block = Block::default()
+        .title(if focused {
+            " Session Head [focus] "
+        } else {
+            " Session Head "
+        })
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    Paragraph::new(checkpoint_row(checkpoint, width))
+        .block(block)
+        .wrap(Wrap { trim: false })
+}
+
 fn footer_paragraph<'a>(
     headline: &'a str,
     status: Option<&'a str>,
@@ -1187,6 +1328,10 @@ fn list_row_width(area: Rect, highlight_symbol: &str) -> usize {
     usize::from(area.width.saturating_sub(2))
         .saturating_sub(text_width(highlight_symbol))
         .saturating_sub(1)
+}
+
+fn panel_row_width(area: Rect) -> usize {
+    usize::from(area.width.saturating_sub(3))
 }
 
 fn line_budget(total_width: usize, fixed_width: usize, min_width: usize) -> usize {
@@ -1280,7 +1425,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{line_budget, parse_diff_files};
-    use crate::model::{CheckpointRecord, Resumability, RuntimeFingerprint};
+    use crate::model::{CheckpointKind, CheckpointRecord, Resumability, RuntimeFingerprint};
     use crate::presentation::{RecoveryCapability, recovery_capability};
 
     #[test]
@@ -1312,6 +1457,7 @@ mod tests {
             id: "cp_test".to_string(),
             timeline_id: "tl_test".to_string(),
             run_id: "run_test".to_string(),
+            kind: CheckpointKind::ProtectedAction,
             parent_checkpoint_id: None,
             reason: "before-shell".to_string(),
             snapshot_rel_path: "snapshots/cp_test".to_string(),
