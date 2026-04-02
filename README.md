@@ -56,7 +56,7 @@ ddl rewind <checkpoint_id>
 
 ## Releasing
 
-GitHub Releases are created from version tags. Push a `v*` tag such as `v0.1.0` and Actions will build release archives for Linux, macOS, and Windows, then attach them to a GitHub release with the same tag name.
+GitHub Releases are created from version tags. Push a `v*` tag such as `v0.1.0` and Actions will build release archives for Linux and macOS, then attach them to a GitHub release with the same tag name.
 
 ```bash
 git tag v0.1.0
