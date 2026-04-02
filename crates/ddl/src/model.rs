@@ -219,19 +219,34 @@ impl RuntimeMetadataRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateMetadataRecord {
+    pub checkout_id: Option<String>,
     pub repo_root: String,
+    pub git_dir: Option<String>,
+    pub git_common_dir: Option<String>,
 }
 
 impl StateMetadataRecord {
     pub fn read(path: &Path) -> Result<Self> {
         let map = read_pairs(path)?;
         Ok(Self {
+            checkout_id: optional_value(&map, "checkout_id"),
             repo_root: required_value(&map, "repo_root")?,
+            git_dir: optional_value(&map, "git_dir"),
+            git_common_dir: optional_value(&map, "git_common_dir"),
         })
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        let pairs = vec![("repo_root", self.repo_root.clone())];
+        let mut pairs = vec![("repo_root", self.repo_root.clone())];
+        if let Some(checkout_id) = &self.checkout_id {
+            pairs.push(("checkout_id", checkout_id.clone()));
+        }
+        if let Some(git_dir) = &self.git_dir {
+            pairs.push(("git_dir", git_dir.clone()));
+        }
+        if let Some(git_common_dir) = &self.git_common_dir {
+            pairs.push(("git_common_dir", git_common_dir.clone()));
+        }
         write_pairs(path, &pairs)
     }
 }

@@ -19,11 +19,18 @@ use crate::runtime::{
 };
 use uuid::Uuid;
 
-const STATE_DIR: &str = ".daedalus";
+const DAEDALUS_HOME_ENV: &str = "DAEDALUS_HOME";
+#[cfg_attr(test, allow(dead_code))]
+const DEFAULT_DAEDALUS_HOME_DIR: &str = ".daedalus";
+const REPOS_DIR_NAME: &str = "repos";
+const LEGACY_STATE_DIR: &str = ".daedalus";
+const CHECKOUT_ID_FILE_NAME: &str = "daedalus-checkout-id";
+const CHECKOUT_BINDING_FORMAT_VERSION: &str = "1";
 const STATE_METADATA_FILE_NAME: &str = "store.meta";
 const SNAPSHOT_DIR_NAME: &str = "snapshots";
 const LEGACY_CONFIG_FILE_NAME: &str = "config";
-const PRESERVED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
+const SNAPSHOT_EXCLUDED_ROOTS: &[&str] = &[".git", ".daedalus", "target"];
+const RESTORE_PRESERVED_ROOTS: &[&str] = &[".git", "target"];
 const CLAUDE_DIR_NAME: &str = ".claude";
 const CLAUDE_PROJECTS_DIR_NAME: &str = "projects";
 const CLAUDE_FILE_HISTORY_DIR_NAME: &str = "file-history";
@@ -32,6 +39,9 @@ const PROVISIONAL_REWINDS_DIR_NAME: &str = "provisional-rewinds";
 #[derive(Clone, Debug)]
 pub struct DaedalusStore {
     repo_root: PathBuf,
+    git_dir: Option<PathBuf>,
+    common_git_dir: Option<PathBuf>,
+    checkout_id: Option<String>,
     state_dir: PathBuf,
     runs_dir: PathBuf,
     timelines_dir: PathBuf,
@@ -85,6 +95,43 @@ struct ProvisionalRewindState {
     last_checkpoint_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct CheckoutContext {
+    repo_root: PathBuf,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct CheckoutBindingRecord {
+    format_version: String,
+    checkout_id: String,
+    repo_root: String,
+    git_dir: String,
+    git_common_dir: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct StoreLocation {
+    repo_root: PathBuf,
+    git_dir: Option<PathBuf>,
+    common_git_dir: Option<PathBuf>,
+    checkout_id: Option<String>,
+    state_dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitOutcome {
+    Initialized,
+    AlreadyInitialized,
+}
+
+#[derive(Clone, Debug)]
+struct InitPreparation {
+    store: DaedalusStore,
+    changed: bool,
+}
+
 impl ProvisionalRewindState {
     fn read(path: &Path) -> Result<Self> {
         let map = read_pairs(path)?;
@@ -97,6 +144,78 @@ impl ProvisionalRewindState {
         let mut pairs = Vec::new();
         if let Some(last_checkpoint_id) = &self.last_checkpoint_id {
             pairs.push(("last_checkpoint_id", last_checkpoint_id.clone()));
+        }
+        write_pairs(path, &pairs)
+    }
+}
+
+impl CheckoutContext {
+    fn resolve(repo_root: &Path) -> Result<Self> {
+        let repo_root = canonicalize_path(repo_root)?;
+        let git_dir = resolve_git_dir(&repo_root)?;
+        let common_git_dir = resolve_common_git_dir(&repo_root)?;
+        Ok(Self {
+            repo_root,
+            git_dir,
+            common_git_dir,
+        })
+    }
+}
+
+impl CheckoutBindingRecord {
+    fn from_context(checkout_id: String, context: &CheckoutContext) -> Self {
+        Self {
+            format_version: CHECKOUT_BINDING_FORMAT_VERSION.to_string(),
+            checkout_id,
+            repo_root: context.repo_root.display().to_string(),
+            git_dir: context.git_dir.display().to_string(),
+            git_common_dir: Some(context.common_git_dir.display().to_string()),
+        }
+    }
+
+    fn read(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(DdlError::InvalidState(format!(
+                "invalid checkout id in {}",
+                CHECKOUT_ID_FILE_NAME
+            )));
+        }
+
+        if !trimmed.contains(':') {
+            validate_checkout_id(trimmed)?;
+            return Ok(Self {
+                format_version: CHECKOUT_BINDING_FORMAT_VERSION.to_string(),
+                checkout_id: trimmed.to_string(),
+                repo_root: String::new(),
+                git_dir: String::new(),
+                git_common_dir: None,
+            });
+        }
+
+        let map = read_pairs(path)?;
+        let checkout_id = required_value(&map, "checkout_id")?;
+        validate_checkout_id(&checkout_id)?;
+        Ok(Self {
+            format_version: optional_value(&map, "format_version")
+                .unwrap_or_else(|| CHECKOUT_BINDING_FORMAT_VERSION.to_string()),
+            checkout_id,
+            repo_root: optional_value(&map, "repo_root").unwrap_or_default(),
+            git_dir: optional_value(&map, "git_dir").unwrap_or_default(),
+            git_common_dir: optional_value(&map, "git_common_dir"),
+        })
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        let mut pairs = vec![
+            ("format_version", self.format_version.clone()),
+            ("checkout_id", self.checkout_id.clone()),
+            ("repo_root", self.repo_root.clone()),
+            ("git_dir", self.git_dir.clone()),
+        ];
+        if let Some(git_common_dir) = &self.git_common_dir {
+            pairs.push(("git_common_dir", git_common_dir.clone()));
         }
         write_pairs(path, &pairs)
     }
@@ -177,27 +296,57 @@ impl DaedalusStore {
 
     pub fn discover_from(cwd: &Path) -> Result<Self> {
         if let Ok(repo_root) = resolve_repo_root(cwd) {
-            let state_dir = repo_root.join(STATE_DIR);
-            return Ok(Self::from_parts(repo_root, state_dir));
+            let preferred = resolve_store_location_for_repo_root(&repo_root)?;
+            let repo_root = preferred.repo_root.clone();
+            let common_git_dir = preferred
+                .common_git_dir
+                .clone()
+                .expect("live repository should resolve common git dir");
+            let state_dir = preferred.state_dir.clone();
+            if state_dir.exists() {
+                sync_state_metadata_if_needed(
+                    &state_dir,
+                    &repo_root,
+                    preferred.checkout_id.as_deref(),
+                    preferred.git_dir.as_deref(),
+                    preferred.common_git_dir.as_deref(),
+                )?;
+                return Ok(Self::from_parts(preferred));
+            }
+
+            if let Some(legacy_state_dir) = find_legacy_repo_state_dir(&repo_root)? {
+                return Ok(Self::from_parts(StoreLocation {
+                    state_dir: legacy_state_dir,
+                    ..preferred
+                }));
+            }
+
+            if let Some(legacy_state_dir) =
+                find_legacy_external_state_dir(&repo_root, &common_git_dir)?
+            {
+                let state_dir = migrate_legacy_external_state_dir(
+                    &legacy_state_dir,
+                    &state_dir,
+                    &repo_root,
+                    preferred.checkout_id.as_deref(),
+                    preferred.git_dir.as_deref(),
+                    preferred.common_git_dir.as_deref(),
+                )?;
+                return Ok(Self::from_parts(StoreLocation {
+                    state_dir,
+                    ..preferred
+                }));
+            }
+
+            return Ok(Self::from_parts(preferred));
         }
 
-        if let Some(state_dir) = find_state_dir(cwd) {
-            let fallback_repo_root =
-                state_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
-                    DdlError::InvalidState("invalid daedalus state directory".to_string())
-                })?;
-            let repo_root = match read_state_metadata_if_present(&state_dir)? {
-                Some(metadata) => {
-                    let stored_repo_root = PathBuf::from(metadata.repo_root);
-                    if stored_repo_root.join(STATE_DIR) == state_dir {
-                        stored_repo_root
-                    } else {
-                        fallback_repo_root.clone()
-                    }
-                }
-                None => fallback_repo_root.clone(),
-            };
-            return Ok(Self::from_parts(repo_root, state_dir));
+        if let Some(location) = find_state_by_metadata(cwd)? {
+            return Ok(Self::from_parts(location));
+        }
+
+        if let Some(location) = find_legacy_state_by_ancestor(cwd)? {
+            return Ok(Self::from_parts(location));
         }
 
         Err(DdlError::InvalidInput(
@@ -205,9 +354,13 @@ impl DaedalusStore {
         ))
     }
 
-    fn from_parts(repo_root: PathBuf, state_dir: PathBuf) -> Self {
+    fn from_parts(location: StoreLocation) -> Self {
+        let state_dir = location.state_dir;
         Self {
-            repo_root,
+            repo_root: location.repo_root,
+            git_dir: location.git_dir,
+            common_git_dir: location.common_git_dir,
+            checkout_id: location.checkout_id,
             runs_dir: state_dir.join("runs"),
             timelines_dir: state_dir.join("timelines"),
             checkpoints_dir: state_dir.join("checkpoints"),
@@ -219,42 +372,89 @@ impl DaedalusStore {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn repo_root(&self) -> &Path {
         &self.repo_root
     }
 
-    pub fn init(&self) -> Result<()> {
-        fs::create_dir_all(&self.runs_dir)?;
-        fs::create_dir_all(&self.timelines_dir)?;
-        fs::create_dir_all(&self.checkpoints_dir)?;
-        fs::create_dir_all(&self.transcripts_dir)?;
-        fs::create_dir_all(&self.tool_outputs_dir)?;
-        fs::create_dir_all(&self.snapshots_dir)?;
-        self.write_state_metadata(&StateMetadataRecord {
-            repo_root: self.repo_root.display().to_string(),
-        })?;
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
 
-        fs::write(self.state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)?;
-        let legacy_config = self.state_dir.join(LEGACY_CONFIG_FILE_NAME);
-        if legacy_config.exists() {
-            fs::remove_file(legacy_config)?;
+    pub fn state_id(&self) -> Result<String> {
+        if let Some(checkout_id) = self.checkout_id.as_deref() {
+            return Ok(checkout_id.to_string());
         }
 
-        if !self.shadow_dir.join(".git").exists() {
+        self.resolved_state_dir()?
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .ok_or_else(|| {
+                DdlError::InvalidState(format!(
+                    "could not determine state id for {}",
+                    self.state_dir.display()
+                ))
+            })
+    }
+
+    pub fn resolved_state_dir(&self) -> Result<PathBuf> {
+        let legacy_state_dir = self.repo_root.join(LEGACY_STATE_DIR);
+        if self.state_dir == legacy_state_dir && !self.state_dir.exists() {
+            return state_dir_for_repo_root(&self.repo_root);
+        }
+        Ok(self.state_dir.clone())
+    }
+
+    pub fn resolved_config_path(&self) -> Result<PathBuf> {
+        Ok(self.resolved_state_dir()?.join(CONFIG_FILE_NAME))
+    }
+
+    pub fn read_config_text(&self) -> Result<String> {
+        let path = self.resolved_config_path()?;
+        if !path.exists() {
+            return Err(DdlError::InvalidConfig(format!(
+                "daedalus checkpointing is not configured at {}; re-run `ddl init`",
+                path.display()
+            )));
+        }
+
+        Ok(fs::read_to_string(path)?)
+    }
+
+    pub fn init(&self) -> Result<InitOutcome> {
+        let InitPreparation { store, mut changed } = self.store_for_init()?;
+        changed |= ensure_directory(&store.runs_dir)?;
+        changed |= ensure_directory(&store.timelines_dir)?;
+        changed |= ensure_directory(&store.checkpoints_dir)?;
+        changed |= ensure_directory(&store.transcripts_dir)?;
+        changed |= ensure_directory(&store.tool_outputs_dir)?;
+        changed |= ensure_directory(&store.snapshots_dir)?;
+        changed |= store.ensure_state_metadata(&store.desired_state_metadata())?;
+        changed |= store.ensure_default_config()?;
+        let legacy_config = store.state_dir.join(LEGACY_CONFIG_FILE_NAME);
+        if legacy_config.exists() {
+            fs::remove_file(legacy_config)?;
+            changed = true;
+        }
+
+        if !store.shadow_dir.join(".git").exists() {
             run_command(
                 Command::new("git")
                     .arg("init")
-                    .arg(&self.shadow_dir)
+                    .arg(&store.shadow_dir)
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped()),
                 "git init",
             )?;
+            changed = true;
         }
 
         let _ = run_command(
             Command::new("git")
                 .arg("-C")
-                .arg(&self.shadow_dir)
+                .arg(&store.shadow_dir)
                 .arg("config")
                 .arg("user.name")
                 .arg("daedalus")
@@ -265,7 +465,7 @@ impl DaedalusStore {
         let _ = run_command(
             Command::new("git")
                 .arg("-C")
-                .arg(&self.shadow_dir)
+                .arg(&store.shadow_dir)
                 .arg("config")
                 .arg("user.email")
                 .arg("daedalus@local")
@@ -274,7 +474,13 @@ impl DaedalusStore {
             "git config",
         );
 
-        Ok(())
+        let _ = remove_legacy_repo_local_exclude(&self.repo_root);
+
+        Ok(if changed {
+            InitOutcome::Initialized
+        } else {
+            InitOutcome::AlreadyInitialized
+        })
     }
 
     pub fn ensure_initialized(&self) -> Result<()> {
@@ -521,7 +727,7 @@ impl DaedalusStore {
             let entry = entry?;
             let name = entry.file_name();
             let name_lossy = name.to_string_lossy();
-            if PRESERVED_ROOTS.contains(&name_lossy.as_ref()) {
+            if RESTORE_PRESERVED_ROOTS.contains(&name_lossy.as_ref()) {
                 continue;
             }
 
@@ -629,16 +835,7 @@ impl DaedalusStore {
     }
 
     fn load_config(&self) -> Result<DaedalusConfig> {
-        let path = self.state_dir.join(CONFIG_FILE_NAME);
-        if !path.exists() {
-            return Err(DdlError::InvalidConfig(format!(
-                "daedalus checkpointing is not configured in {}; re-run `ddl init` or migrate to {}",
-                self.repo_root.display(),
-                path.display()
-            )));
-        }
-
-        let raw = fs::read_to_string(&path)?;
+        let raw = self.read_config_text()?;
         DaedalusConfig::parse(&raw)
     }
 
@@ -664,6 +861,98 @@ impl DaedalusStore {
 
     fn write_state_metadata(&self, metadata: &StateMetadataRecord) -> Result<()> {
         metadata.write(&self.state_metadata_path())
+    }
+
+    fn ensure_state_metadata(&self, metadata: &StateMetadataRecord) -> Result<bool> {
+        let path = self.state_metadata_path();
+        if path.exists() {
+            match StateMetadataRecord::read(&path) {
+                Ok(existing) if existing == *metadata => return Ok(false),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        self.write_state_metadata(metadata)?;
+        Ok(true)
+    }
+
+    fn ensure_default_config(&self) -> Result<bool> {
+        let path = self.state_dir.join(CONFIG_FILE_NAME);
+        if path.exists() {
+            return Ok(false);
+        }
+
+        fs::write(path, DEFAULT_CONFIG_JSON)?;
+        Ok(true)
+    }
+
+    fn store_for_init(&self) -> Result<InitPreparation> {
+        let (state_dir, changed) = self.prepare_state_dir_for_init()?;
+        Ok(InitPreparation {
+            store: Self::from_parts(StoreLocation {
+                repo_root: self.repo_root.clone(),
+                git_dir: self.git_dir.clone(),
+                common_git_dir: self.common_git_dir.clone(),
+                checkout_id: self.checkout_id.clone(),
+                state_dir,
+            }),
+            changed,
+        })
+    }
+
+    fn prepare_state_dir_for_init(&self) -> Result<(PathBuf, bool)> {
+        let legacy_state_dir = self.repo_root.join(LEGACY_STATE_DIR);
+        let preferred_state_dir = self.preferred_state_dir()?;
+        if self.state_dir == legacy_state_dir {
+            if preferred_state_dir.exists() {
+                return Err(DdlError::InvalidState(format!(
+                    "found both legacy repo-local state at {} and external state at {}; remove the legacy directory after verifying the external state or move it aside before re-running `ddl init`",
+                    legacy_state_dir.display(),
+                    preferred_state_dir.display()
+                )));
+            }
+            move_path(&legacy_state_dir, &preferred_state_dir)?;
+            return Ok((preferred_state_dir, true));
+        }
+
+        Ok((self.state_dir.clone(), self.migrate_legacy_repo_state()?))
+    }
+
+    fn desired_state_metadata(&self) -> StateMetadataRecord {
+        StateMetadataRecord {
+            checkout_id: self.checkout_id.clone(),
+            repo_root: self.repo_root.display().to_string(),
+            git_dir: self.git_dir.as_ref().map(|path| path.display().to_string()),
+            git_common_dir: self
+                .common_git_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        }
+    }
+
+    fn preferred_state_dir(&self) -> Result<PathBuf> {
+        match self.checkout_id.as_deref() {
+            Some(checkout_id) => state_dir_for_checkout_id(checkout_id),
+            None => state_dir_for_repo_root(&self.repo_root),
+        }
+    }
+
+    fn migrate_legacy_repo_state(&self) -> Result<bool> {
+        let legacy_state_dir = self.repo_root.join(LEGACY_STATE_DIR);
+        if !legacy_state_dir.exists() {
+            return Ok(false);
+        }
+
+        if self.state_dir.exists() {
+            return Err(DdlError::InvalidState(format!(
+                "found both legacy repo-local state at {} and external state at {}; remove the legacy directory after verifying the external state or move it aside before re-running `ddl init`",
+                legacy_state_dir.display(),
+                self.state_dir.display()
+            )));
+        }
+
+        move_path(&legacy_state_dir, &self.state_dir)?;
+        Ok(true)
     }
 
     fn create_standalone_shell_run(&self, command: &[String]) -> Result<StandaloneShellRun> {
@@ -1708,14 +1997,213 @@ fn resolve_repo_root(cwd: &Path) -> Result<PathBuf> {
     }
 }
 
-fn find_state_dir(cwd: &Path) -> Option<PathBuf> {
-    for ancestor in cwd.ancestors() {
-        let candidate = ancestor.join(STATE_DIR);
-        if candidate.is_dir() {
-            return Some(candidate);
+fn resolve_common_git_dir(repo_root: &Path) -> Result<PathBuf> {
+    let common_git_dir = read_git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("rev-parse")
+            .arg("--path-format=absolute")
+            .arg("--git-common-dir"),
+        "git rev-parse --git-common-dir",
+    )?;
+    canonicalize_path(Path::new(&common_git_dir))
+}
+
+fn resolve_git_dir(repo_root: &Path) -> Result<PathBuf> {
+    let git_dir = read_git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("rev-parse")
+            .arg("--path-format=absolute")
+            .arg("--git-dir"),
+        "git rev-parse --git-dir",
+    )?;
+    canonicalize_path(Path::new(&git_dir))
+}
+
+fn resolve_daedalus_home() -> Result<PathBuf> {
+    if let Some(path) = env::var_os(DAEDALUS_HOME_ENV).filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+
+    #[cfg(test)]
+    {
+        return Ok(std::env::temp_dir().join("ddl-test-daedalus-home"));
+    }
+
+    #[cfg(not(test))]
+    {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            DdlError::InvalidState(format!(
+                "{DAEDALUS_HOME_ENV} is not set and HOME is unavailable"
+            ))
+        })?;
+        Ok(PathBuf::from(home).join(DEFAULT_DAEDALUS_HOME_DIR))
+    }
+}
+
+fn repos_root(daedalus_home: &Path) -> PathBuf {
+    daedalus_home.join(REPOS_DIR_NAME)
+}
+
+fn checkout_id_path(git_dir: &Path) -> PathBuf {
+    git_dir.join(CHECKOUT_ID_FILE_NAME)
+}
+
+fn validate_checkout_id(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|char| !(char.is_ascii_alphanumeric() || char == '-'))
+    {
+        return Err(DdlError::InvalidState(format!(
+            "invalid checkout id in {}",
+            CHECKOUT_ID_FILE_NAME
+        )));
+    }
+    Ok(())
+}
+
+fn read_checkout_binding_if_present(git_dir: &Path) -> Result<Option<CheckoutBindingRecord>> {
+    let path = checkout_id_path(git_dir);
+    match CheckoutBindingRecord::read(&path) {
+        Ok(record) => Ok(Some(record)),
+        Err(DdlError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn live_path_mismatch_indicates_other_checkout(stored: &str, current: &Path) -> Result<bool> {
+    if stored.is_empty() {
+        return Ok(false);
+    }
+
+    let stored = canonicalize_path(Path::new(stored))?;
+    Ok(stored != current && stored.exists())
+}
+
+fn local_binding_belongs_to_current_checkout(
+    binding: &CheckoutBindingRecord,
+    context: &CheckoutContext,
+) -> Result<bool> {
+    if live_path_mismatch_indicates_other_checkout(&binding.git_dir, &context.git_dir)? {
+        return Ok(false);
+    }
+    if live_path_mismatch_indicates_other_checkout(&binding.repo_root, &context.repo_root)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn state_metadata_belongs_to_current_checkout(
+    metadata: &StateMetadataRecord,
+    binding: &CheckoutBindingRecord,
+    context: &CheckoutContext,
+) -> Result<bool> {
+    if let Some(checkout_id) = metadata.checkout_id.as_deref() {
+        validate_checkout_id(checkout_id)?;
+        if checkout_id != binding.checkout_id {
+            let other_state_dir = state_dir_for_checkout_id(checkout_id)?;
+            if other_state_dir.exists() {
+                return Ok(false);
+            }
         }
     }
-    None
+
+    if let Some(git_dir) = metadata.git_dir.as_deref() {
+        if live_path_mismatch_indicates_other_checkout(git_dir, &context.git_dir)? {
+            return Ok(false);
+        }
+    }
+
+    if live_path_mismatch_indicates_other_checkout(&metadata.repo_root, &context.repo_root)? {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+fn write_checkout_binding(git_dir: &Path, binding: &CheckoutBindingRecord) -> Result<()> {
+    binding.write(&checkout_id_path(git_dir))
+}
+
+fn create_checkout_binding(context: &CheckoutContext) -> Result<CheckoutBindingRecord> {
+    Ok(CheckoutBindingRecord::from_context(
+        Uuid::new_v4().simple().to_string(),
+        context,
+    ))
+}
+
+fn resolve_checkout_binding(context: &CheckoutContext) -> Result<CheckoutBindingRecord> {
+    let mut binding = match read_checkout_binding_if_present(&context.git_dir)? {
+        Some(binding) => {
+            if local_binding_belongs_to_current_checkout(&binding, context)? {
+                binding
+            } else {
+                create_checkout_binding(context)?
+            }
+        }
+        None => create_checkout_binding(context)?,
+    };
+
+    let state_dir = state_dir_for_checkout_id(&binding.checkout_id)?;
+    if let Some(metadata) = read_state_metadata_if_present(&state_dir)? {
+        if !state_metadata_belongs_to_current_checkout(&metadata, &binding, context)? {
+            binding = create_checkout_binding(context)?;
+        }
+    }
+
+    let desired = CheckoutBindingRecord::from_context(binding.checkout_id.clone(), context);
+    if binding.format_version != desired.format_version
+        || binding.repo_root != desired.repo_root
+        || binding.git_dir != desired.git_dir
+        || binding.git_common_dir != desired.git_common_dir
+    {
+        binding = desired;
+    }
+
+    write_checkout_binding(&context.git_dir, &binding)?;
+    Ok(binding)
+}
+
+fn state_dir_for_checkout_id(checkout_id: &str) -> Result<PathBuf> {
+    validate_checkout_id(checkout_id)?;
+    Ok(repos_root(&resolve_daedalus_home()?).join(checkout_id))
+}
+
+fn derive_legacy_repo_id(path: &Path) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn state_dir_for_repo_root(repo_root: &Path) -> Result<PathBuf> {
+    Ok(resolve_store_location_for_repo_root(repo_root)?.state_dir)
+}
+
+fn resolve_store_location_for_repo_root(repo_root: &Path) -> Result<StoreLocation> {
+    let context = CheckoutContext::resolve(repo_root)?;
+    let binding = resolve_checkout_binding(&context)?;
+    Ok(StoreLocation {
+        repo_root: context.repo_root,
+        git_dir: Some(context.git_dir),
+        common_git_dir: Some(context.common_git_dir),
+        checkout_id: Some(binding.checkout_id.clone()),
+        state_dir: state_dir_for_checkout_id(&binding.checkout_id)?,
+    })
+}
+
+fn legacy_state_dir_for_repo_root(repo_root: &Path) -> Result<PathBuf> {
+    Ok(repos_root(&resolve_daedalus_home()?).join(derive_legacy_repo_id(repo_root)))
+}
+
+fn legacy_state_dir_for_common_git_dir(common_git_dir: &Path) -> Result<PathBuf> {
+    Ok(repos_root(&resolve_daedalus_home()?).join(derive_legacy_repo_id(common_git_dir)))
 }
 
 fn read_state_metadata_if_present(state_dir: &Path) -> Result<Option<StateMetadataRecord>> {
@@ -1723,7 +2211,206 @@ fn read_state_metadata_if_present(state_dir: &Path) -> Result<Option<StateMetada
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(StateMetadataRecord::read(&path)?))
+    match StateMetadataRecord::read(&path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(DdlError::InvalidState(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn find_state_by_metadata(cwd: &Path) -> Result<Option<StoreLocation>> {
+    let cwd = canonicalize_path(cwd)?;
+    let repos_root = repos_root(&resolve_daedalus_home()?);
+    if !repos_root.exists() {
+        return Ok(None);
+    }
+
+    let mut best_match: Option<StoreLocation> = None;
+    for entry in fs::read_dir(&repos_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let state_dir = entry.path();
+        let Some(metadata) = read_state_metadata_if_present(&state_dir)? else {
+            continue;
+        };
+
+        let repo_root = canonicalize_path(Path::new(&metadata.repo_root))?;
+        if cwd != repo_root && !cwd.starts_with(&repo_root) {
+            continue;
+        }
+
+        let git_dir = metadata
+            .git_dir
+            .as_deref()
+            .map(Path::new)
+            .map(canonicalize_path)
+            .transpose()?;
+        let common_git_dir = metadata
+            .git_common_dir
+            .as_deref()
+            .map(Path::new)
+            .map(canonicalize_path)
+            .transpose()?;
+        let candidate = StoreLocation {
+            repo_root,
+            git_dir,
+            common_git_dir,
+            checkout_id: metadata.checkout_id,
+            state_dir,
+        };
+        let candidate_depth = candidate.repo_root.components().count();
+        let replace = best_match
+            .as_ref()
+            .is_none_or(|current| candidate_depth > current.repo_root.components().count());
+        if replace {
+            best_match = Some(candidate);
+        }
+    }
+
+    Ok(best_match)
+}
+
+fn find_legacy_repo_state_dir(repo_root: &Path) -> Result<Option<PathBuf>> {
+    let candidate = repo_root.join(LEGACY_STATE_DIR);
+    if is_legacy_state_dir(&candidate) {
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
+fn find_legacy_external_state_dir(
+    repo_root: &Path,
+    common_git_dir: &Path,
+) -> Result<Option<PathBuf>> {
+    for candidate in [
+        legacy_state_dir_for_repo_root(repo_root)?,
+        legacy_state_dir_for_common_git_dir(common_git_dir)?,
+    ] {
+        if !candidate.exists() {
+            continue;
+        }
+
+        let matches_repo = match read_state_metadata_if_present(&candidate)? {
+            Some(metadata) => {
+                let stored_repo_root = canonicalize_path(Path::new(&metadata.repo_root))?;
+                stored_repo_root == repo_root
+            }
+            None => true,
+        };
+        if matches_repo {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+fn find_legacy_state_by_ancestor(cwd: &Path) -> Result<Option<StoreLocation>> {
+    let cwd = canonicalize_path(cwd)?;
+    for ancestor in cwd.ancestors() {
+        let state_dir = ancestor.join(LEGACY_STATE_DIR);
+        if !is_legacy_state_dir(&state_dir) {
+            continue;
+        }
+
+        let metadata = read_state_metadata_if_present(&state_dir)?;
+        let repo_root = match metadata.as_ref() {
+            Some(metadata) => canonicalize_path(Path::new(&metadata.repo_root))?,
+            None => ancestor.to_path_buf(),
+        };
+        let git_dir = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.git_dir.as_deref())
+            .map(Path::new)
+            .map(canonicalize_path)
+            .transpose()?;
+        let common_git_dir = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.git_common_dir.as_deref())
+            .map(Path::new)
+            .map(canonicalize_path)
+            .transpose()?;
+        return Ok(Some(StoreLocation {
+            repo_root,
+            git_dir,
+            common_git_dir,
+            checkout_id: metadata.and_then(|metadata| metadata.checkout_id),
+            state_dir,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn is_legacy_state_dir(path: &Path) -> bool {
+    path.is_dir()
+        && [
+            path.join(CONFIG_FILE_NAME),
+            path.join(STATE_METADATA_FILE_NAME),
+            path.join("checkpoints"),
+            path.join("runs"),
+            path.join("timelines"),
+            path.join("shadow"),
+        ]
+        .into_iter()
+        .any(|entry| entry.exists())
+}
+
+fn canonicalize_path(path: &Path) -> Result<PathBuf> {
+    match path.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn sync_state_metadata_if_needed(
+    state_dir: &Path,
+    repo_root: &Path,
+    checkout_id: Option<&str>,
+    git_dir: Option<&Path>,
+    common_git_dir: Option<&Path>,
+) -> Result<()> {
+    if !state_dir.exists() {
+        return Ok(());
+    }
+
+    let desired = StateMetadataRecord {
+        checkout_id: checkout_id.map(ToOwned::to_owned),
+        repo_root: repo_root.display().to_string(),
+        git_dir: git_dir.map(|path| path.display().to_string()),
+        git_common_dir: common_git_dir.map(|path| path.display().to_string()),
+    };
+    let current = read_state_metadata_if_present(state_dir)?;
+    if current.as_ref() == Some(&desired) {
+        return Ok(());
+    }
+
+    desired.write(&state_dir.join(STATE_METADATA_FILE_NAME))
+}
+
+fn migrate_legacy_external_state_dir(
+    legacy_state_dir: &Path,
+    preferred_state_dir: &Path,
+    repo_root: &Path,
+    checkout_id: Option<&str>,
+    git_dir: Option<&Path>,
+    common_git_dir: Option<&Path>,
+) -> Result<PathBuf> {
+    if legacy_state_dir != preferred_state_dir {
+        move_path(legacy_state_dir, preferred_state_dir)?;
+    }
+    sync_state_metadata_if_needed(
+        preferred_state_dir,
+        repo_root,
+        checkout_id,
+        git_dir,
+        common_git_dir,
+    )?;
+    Ok(preferred_state_dir.to_path_buf())
 }
 
 fn list_meta_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -1747,7 +2434,7 @@ fn copy_workspace_to_snapshot(repo_root: &Path, snapshot_path: &Path) -> Result<
         let entry = entry?;
         let name = entry.file_name();
         let name_lossy = name.to_string_lossy();
-        if PRESERVED_ROOTS.contains(&name_lossy.as_ref()) {
+        if SNAPSHOT_EXCLUDED_ROOTS.contains(&name_lossy.as_ref()) {
             continue;
         }
 
@@ -1803,6 +2490,15 @@ fn move_path(source: &Path, destination: &Path) -> Result<()> {
             remove_path(source)
         }
     }
+}
+
+fn ensure_directory(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(path)?;
+    Ok(true)
 }
 
 fn remove_path(path: &Path) -> Result<()> {
@@ -1882,6 +2578,46 @@ fn run_command(command: &mut Command, label: &str) -> Result<()> {
     }
 }
 
+fn remove_legacy_repo_local_exclude(repo_root: &Path) -> Result<()> {
+    let exclude_path = PathBuf::from(read_git_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("rev-parse")
+            .arg("--path-format=absolute")
+            .arg("--git-path")
+            .arg("info/exclude"),
+        "git rev-parse",
+    )?);
+
+    let existing = match fs::read_to_string(&exclude_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+
+    let filtered = existing
+        .lines()
+        .filter(|line| !is_legacy_state_dir_exclude(line))
+        .collect::<Vec<_>>();
+    let mut updated = filtered.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    if updated == existing {
+        return Ok(());
+    }
+    fs::write(exclude_path, updated)?;
+    Ok(())
+}
+
+fn is_legacy_state_dir_exclude(line: &str) -> bool {
+    matches!(
+        line.trim(),
+        ".daedalus" | ".daedalus/" | "/.daedalus" | "/.daedalus/"
+    )
+}
+
 fn read_git_output(command: &mut Command, label: &str) -> Result<String> {
     let output = command.output()?;
     if output.status.success() {
@@ -1926,11 +2662,16 @@ mod tests {
 
     use crate::config::{CONFIG_FILE_NAME, DEFAULT_CONFIG_JSON};
     use crate::model::{
-        CheckpointKind, Resumability, RunRecord, RunStatus, RuntimeMetadataRecord, TimelineRecord,
+        CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
+        RuntimeMetadataRecord, StateMetadataRecord, TimelineRecord,
     };
     use crate::runtime::{ENV_RUN_ID, ENV_RUNTIME, ENV_TIMELINE_ID};
 
-    use super::DaedalusStore;
+    use super::{
+        DaedalusStore, InitOutcome, STATE_METADATA_FILE_NAME, canonicalize_path, checkout_id_path,
+        copy_path, legacy_state_dir_for_repo_root, read_checkout_binding_if_present,
+        read_state_metadata_if_present, resolve_common_git_dir, resolve_git_dir,
+    };
 
     fn test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1948,19 +2689,135 @@ mod tests {
         let repo_root = create_temp_repo("init");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
-        store.init().expect("initialize store");
+        let outcome = store.init().expect("initialize store");
 
-        assert!(repo_root.join(".daedalus").exists());
-        assert!(repo_root.join(".daedalus/shadow/.git").exists());
-        assert!(repo_root.join(".daedalus/checkpoints").exists());
-        assert!(repo_root.join(".daedalus/store.meta").exists());
+        assert_eq!(outcome, InitOutcome::Initialized);
+        assert!(!repo_root.join(".daedalus").exists());
+        assert!(store.state_dir().exists());
+        assert!(store.state_dir().join("shadow/.git").exists());
+        assert!(store.state_dir().join("checkpoints").exists());
+        assert!(store.state_dir().join("store.meta").exists());
         assert_eq!(
-            fs::read_to_string(repo_root.join(".daedalus").join(CONFIG_FILE_NAME))
-                .expect("read config"),
+            fs::read_to_string(store.state_dir().join(CONFIG_FILE_NAME)).expect("read config"),
             DEFAULT_CONFIG_JSON
         );
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_preserves_existing_config_and_reports_already_initialized() {
+        let repo_root = create_temp_repo("init-idempotent");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let config_path = store.state_dir().join(CONFIG_FILE_NAME);
+        let custom_config = r#"{
+  "checkpointing": {
+    "before": [
+      "Edit(*)",
+      "Bash(npm install:*)"
+    ]
+  }
+}
+"#;
+        fs::write(&config_path, custom_config).expect("write custom config");
+
+        let outcome = store.init().expect("reinitialize store");
+        assert_eq!(outcome, InitOutcome::AlreadyInitialized);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            custom_config
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_keeps_daedalus_out_of_parent_git_repo() {
+        let repo_root = create_temp_repo("init-no-worktree-state");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+        fs::write(repo_root.join("tracked.txt"), "hello").expect("write tracked file");
+
+        let add_output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("add")
+            .arg(".")
+            .output()
+            .expect("git add");
+        assert!(
+            add_output.status.success(),
+            "git add failed: {}",
+            String::from_utf8_lossy(&add_output.stderr)
+        );
+
+        let status_output = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("status")
+            .arg("--short")
+            .output()
+            .expect("git status");
+        let status = String::from_utf8_lossy(&status_output.stdout);
+        assert!(status.contains("tracked.txt"));
+        assert!(!status.contains(".daedalus"));
+        assert!(!repo_root.join(".daedalus").exists());
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_migrates_legacy_repo_local_state_to_external_home() {
+        let repo_root = create_temp_repo("init-migrate");
+        let legacy_state_dir = repo_root.join(".daedalus");
+        fs::create_dir_all(legacy_state_dir.join("checkpoints"))
+            .expect("create legacy checkpoints");
+        fs::write(legacy_state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)
+            .expect("write legacy config");
+        fs::write(legacy_state_dir.join("store.meta"), "repo_root=/legacy\n")
+            .expect("write legacy metadata");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        assert!(!legacy_state_dir.exists());
+        assert!(
+            store
+                .resolved_state_dir()
+                .expect("resolved state dir")
+                .join("checkpoints")
+                .exists()
+        );
+        assert_eq!(
+            fs::read_to_string(
+                store
+                    .resolved_state_dir()
+                    .expect("resolved state dir")
+                    .join(CONFIG_FILE_NAME)
+            )
+            .expect("read migrated config"),
+            DEFAULT_CONFIG_JSON
+        );
+    }
+
+    #[test]
+    fn init_fails_when_legacy_and_external_state_both_exist() {
+        let repo_root = create_temp_repo("init-conflict");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        fs::create_dir_all(repo_root.join(".daedalus")).expect("create legacy state");
+        fs::create_dir_all(store.state_dir()).expect("create external state");
+
+        let error = store
+            .init()
+            .expect_err("init should fail on state conflict");
+        assert!(
+            error
+                .to_string()
+                .contains("found both legacy repo-local state")
+        );
     }
 
     #[test]
@@ -1974,7 +2831,13 @@ mod tests {
         fs::remove_dir_all(repo_root.join(".git")).expect("remove live git dir");
 
         let discovered = DaedalusStore::discover_from(&nested).expect("discover from nested dir");
-        assert_eq!(discovered.repo_root(), repo_root.as_path());
+        assert_eq!(
+            discovered
+                .repo_root()
+                .canonicalize()
+                .expect("canonical discovered repo root"),
+            repo_root.canonicalize().expect("canonical repo root")
+        );
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
@@ -2024,11 +2887,371 @@ mod tests {
         let inner_store = DaedalusStore::discover_from(&inner_repo).expect("discover inner store");
         inner_store.init().expect("initialize inner store");
 
-        assert!(outer_repo.join(".daedalus/store.meta").exists());
-        assert!(inner_repo.join(".daedalus/store.meta").exists());
-        assert!(inner_repo.join(".daedalus/shadow/.git").exists());
+        assert!(outer_store.state_dir().join("store.meta").exists());
+        assert!(inner_store.state_dir().join("store.meta").exists());
+        assert!(inner_store.state_dir().join("shadow/.git").exists());
+        assert_ne!(outer_store.state_dir(), inner_store.state_dir());
 
         fs::remove_dir_all(outer_repo).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_git_worktree_uses_distinct_external_state() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("worktree-shared-state");
+        configure_test_git_identity(&repo_root);
+        fs::write(repo_root.join("tracked.txt"), "hello\n").expect("write tracked file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("add")
+            .arg("tracked.txt")
+            .output()
+            .expect("git add tracked file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial")
+            .output()
+            .expect("git commit tracked file");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let worktree_root = std::env::temp_dir().join(format!(
+            "ddl-store-worktree-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("add")
+            .arg(&worktree_root)
+            .output()
+            .expect("git worktree add");
+
+        let worktree_store =
+            DaedalusStore::discover_from(&worktree_root).expect("discover worktree store");
+        assert_ne!(store.state_dir(), worktree_store.state_dir());
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(&worktree_root)
+            .output()
+            .expect("git worktree remove");
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn git_worktrees_do_not_share_checkpoints() {
+        let _guard = lock_tests();
+        let repo_root = create_temp_repo("worktree-isolated-checkpoints");
+        configure_test_git_identity(&repo_root);
+        fs::write(repo_root.join("tracked.txt"), "hello\n").expect("write tracked file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("add")
+            .arg("tracked.txt")
+            .output()
+            .expect("git add tracked file");
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("commit")
+            .arg("-m")
+            .arg("initial")
+            .output()
+            .expect("git commit tracked file");
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let worktree_root = std::env::temp_dir().join(format!(
+            "ddl-store-worktree-isolated-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("add")
+            .arg(&worktree_root)
+            .output()
+            .expect("git worktree add");
+
+        let worktree_store =
+            DaedalusStore::discover_from(&worktree_root).expect("discover worktree store");
+        worktree_store.init().expect("initialize worktree store");
+
+        let (run_id, timeline_id) = create_active_run(&store, "claude");
+        store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::ProtectedAction,
+                "before-edit".to_string(),
+                super::CheckpointTriggerMetadata::default(),
+            )
+            .expect("create checkpoint");
+
+        assert_eq!(
+            store
+                .list_checkpoints()
+                .expect("list store checkpoints")
+                .len(),
+            1
+        );
+        assert!(
+            worktree_store
+                .list_checkpoints()
+                .expect("list worktree checkpoints")
+                .is_empty()
+        );
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .arg("worktree")
+            .arg("remove")
+            .arg("--force")
+            .arg(&worktree_root)
+            .output()
+            .expect("git worktree remove");
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_regenerates_checkout_id_for_copied_repo() {
+        let repo_root = create_temp_repo("discover-copied-repo");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let (run_id, timeline_id) = create_active_run(&store, "claude");
+        store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::ProtectedAction,
+                "before-copy".to_string(),
+                super::CheckpointTriggerMetadata::default(),
+            )
+            .expect("create checkpoint");
+
+        let original_git_dir = resolve_git_dir(&repo_root).expect("resolve original git dir");
+        let original_binding = read_checkout_binding_if_present(&original_git_dir)
+            .expect("read original binding")
+            .expect("original binding present");
+
+        let copied_repo_root = repo_root.with_file_name(format!(
+            "{}-copy",
+            repo_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("repo dir name")
+        ));
+        copy_path(&repo_root, &copied_repo_root).expect("copy repo");
+
+        let copied_store =
+            DaedalusStore::discover_from(&copied_repo_root).expect("discover copied repo");
+        copied_store.init().expect("initialize copied store");
+
+        let copied_git_dir = resolve_git_dir(&copied_repo_root).expect("resolve copied git dir");
+        let copied_binding = read_checkout_binding_if_present(&copied_git_dir)
+            .expect("read copied binding")
+            .expect("copied binding present");
+
+        assert_ne!(store.state_dir(), copied_store.state_dir());
+        assert_ne!(original_binding.checkout_id, copied_binding.checkout_id);
+        assert_eq!(
+            store
+                .list_checkpoints()
+                .expect("list original checkpoints")
+                .len(),
+            1
+        );
+        assert!(
+            copied_store
+                .list_checkpoints()
+                .expect("list copied checkpoints")
+                .is_empty()
+        );
+
+        fs::remove_dir_all(copied_repo_root).expect("cleanup copied repo");
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_upgrades_legacy_checkout_id_marker() {
+        let repo_root = create_temp_repo("discover-upgrade-checkout-marker");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let git_dir = resolve_git_dir(&repo_root).expect("resolve git dir");
+        let binding = read_checkout_binding_if_present(&git_dir)
+            .expect("read binding")
+            .expect("binding present");
+        fs::write(
+            checkout_id_path(&git_dir),
+            format!("{}\n", binding.checkout_id),
+        )
+        .expect("write legacy checkout marker");
+
+        let discovered = DaedalusStore::discover_from(&repo_root).expect("rediscover store");
+        let upgraded_binding = read_checkout_binding_if_present(&git_dir)
+            .expect("read upgraded binding")
+            .expect("upgraded binding present");
+        let marker = fs::read_to_string(checkout_id_path(&git_dir)).expect("read marker");
+
+        assert_eq!(discovered.state_dir(), store.state_dir());
+        assert_eq!(upgraded_binding.checkout_id, binding.checkout_id);
+        assert!(marker.contains("format_version:"));
+        assert!(marker.contains("checkout_id:"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_keeps_external_state_after_repo_move() {
+        let repo_root = create_temp_repo("discover-moved-repo");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let (run_id, timeline_id) = create_active_run(&store, "claude");
+        store
+            .create_checkpoint_internal(
+                &timeline_id,
+                &run_id,
+                None,
+                CheckpointKind::ProtectedAction,
+                "before-move".to_string(),
+                super::CheckpointTriggerMetadata::default(),
+            )
+            .expect("create checkpoint");
+
+        let original_state_dir = store.state_dir().to_path_buf();
+        let relocated_repo_root = repo_root.with_file_name(format!(
+            "{}-moved",
+            repo_root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("repo dir name")
+        ));
+        fs::rename(&repo_root, &relocated_repo_root).expect("move repo");
+
+        let discovered =
+            DaedalusStore::discover_from(&relocated_repo_root).expect("discover moved repo");
+        let metadata = read_state_metadata_if_present(discovered.state_dir())
+            .expect("read moved metadata")
+            .expect("moved metadata");
+
+        assert_eq!(discovered.state_dir(), original_state_dir.as_path());
+        assert_eq!(
+            discovered
+                .list_checkpoints()
+                .expect("list moved checkpoints")
+                .len(),
+            1
+        );
+        assert_eq!(
+            canonicalize_path(Path::new(&metadata.repo_root))
+                .expect("canonical metadata repo root"),
+            relocated_repo_root
+                .canonicalize()
+                .expect("canonical relocated repo root")
+        );
+
+        fs::remove_dir_all(relocated_repo_root).expect("cleanup moved repo");
+    }
+
+    #[test]
+    fn discover_from_migrates_legacy_external_state_to_checkout_id_state() {
+        let repo_root = create_temp_repo("discover-migrate-legacy-external");
+        let legacy_state_dir = seed_legacy_external_state(&repo_root);
+
+        let discovered = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        let metadata = read_state_metadata_if_present(discovered.state_dir())
+            .expect("read migrated metadata")
+            .expect("migrated metadata");
+
+        assert!(!legacy_state_dir.exists());
+        assert_ne!(discovered.state_dir(), legacy_state_dir.as_path());
+        assert_eq!(
+            discovered
+                .list_checkpoints()
+                .expect("list migrated checkpoints")
+                .len(),
+            1
+        );
+        assert_eq!(
+            canonicalize_path(Path::new(&metadata.repo_root))
+                .expect("canonical metadata repo root"),
+            repo_root.canonicalize().expect("canonical repo root")
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_prefers_legacy_repo_local_state_before_new_external_state() {
+        let repo_root = create_temp_repo("discover-legacy-repo-local");
+        let legacy_state_dir = seed_legacy_repo_local_state(&repo_root);
+
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        let checkpoints = store.list_checkpoints().expect("list checkpoints");
+
+        assert_eq!(
+            store
+                .state_dir()
+                .canonicalize()
+                .expect("canonical discovered state dir"),
+            legacy_state_dir
+                .canonicalize()
+                .expect("canonical legacy state dir")
+        );
+        assert_eq!(checkpoints.len(), 1);
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn discover_from_uses_legacy_repo_local_state_without_live_git() {
+        let repo_root = create_temp_repo("discover-legacy-without-git");
+        let nested = repo_root.join("nested");
+        fs::create_dir_all(&nested).expect("create nested dir");
+        let legacy_state_dir = seed_legacy_repo_local_state(&repo_root);
+        fs::remove_dir_all(repo_root.join(".git")).expect("remove live git dir");
+
+        let store = DaedalusStore::discover_from(&nested).expect("discover store");
+        let checkpoints = store.list_checkpoints().expect("list checkpoints");
+
+        assert_eq!(
+            store
+                .state_dir()
+                .canonicalize()
+                .expect("canonical discovered state dir"),
+            legacy_state_dir
+                .canonicalize()
+                .expect("canonical legacy state dir")
+        );
+        assert_eq!(checkpoints.len(), 1);
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
     }
 
     #[test]
@@ -2491,7 +3714,7 @@ mod tests {
             Some(session_id.as_str())
         );
         assert_eq!(checkpoint.resumability, Resumability::Full);
-        let rewind_path = repo_root.join(".daedalus").join(
+        let rewind_path = store.state_dir().join(
             checkpoint
                 .claude_rewind_rel_path
                 .as_deref()
@@ -3172,6 +4395,98 @@ mod tests {
         ));
         fs::create_dir_all(&path).expect("create temp home");
         path
+    }
+
+    fn seed_legacy_repo_local_state(repo_root: &Path) -> PathBuf {
+        let legacy_state_dir = repo_root.join(".daedalus");
+        seed_state_dir(&legacy_state_dir, repo_root, None);
+        legacy_state_dir
+    }
+
+    fn seed_legacy_external_state(repo_root: &Path) -> PathBuf {
+        let canonical_repo_root = canonicalize_path(repo_root).expect("canonical repo root");
+        let legacy_state_dir = legacy_state_dir_for_repo_root(&canonical_repo_root)
+            .expect("legacy external state dir");
+        let common_git_dir = resolve_common_git_dir(repo_root).expect("resolve common git dir");
+        seed_state_dir(
+            &legacy_state_dir,
+            &canonical_repo_root,
+            Some(&common_git_dir),
+        );
+        legacy_state_dir
+    }
+
+    fn seed_state_dir(state_dir: &Path, repo_root: &Path, common_git_dir: Option<&Path>) {
+        let repo_root = canonicalize_path(repo_root).expect("canonical repo root");
+        let common_git_dir = common_git_dir
+            .map(canonicalize_path)
+            .transpose()
+            .expect("canonical common git dir");
+        fs::create_dir_all(state_dir.join("checkpoints")).expect("create legacy checkpoints");
+        fs::create_dir_all(state_dir.join("shadow")).expect("create legacy shadow dir");
+        Command::new("git")
+            .arg("init")
+            .arg(state_dir.join("shadow"))
+            .output()
+            .expect("git init legacy shadow");
+        fs::write(state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)
+            .expect("write legacy config");
+        StateMetadataRecord {
+            checkout_id: None,
+            repo_root: repo_root.display().to_string(),
+            git_dir: None,
+            git_common_dir: common_git_dir
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        }
+        .write(&state_dir.join(STATE_METADATA_FILE_NAME))
+        .expect("write legacy metadata");
+        CheckpointRecord {
+            id: "cp_legacy".to_string(),
+            timeline_id: "tl_legacy".to_string(),
+            run_id: "run_legacy".to_string(),
+            kind: CheckpointKind::ProtectedAction,
+            parent_checkpoint_id: None,
+            reason: "before-edit".to_string(),
+            snapshot_rel_path: "snapshots/cp_legacy".to_string(),
+            shadow_commit: "deadbeef".to_string(),
+            created_at: 1,
+            resumability: Resumability::Unavailable,
+            trigger_tool_type: None,
+            trigger_command: None,
+            runtime_name: None,
+            claude_session_id: None,
+            claude_rewind_rel_path: None,
+            fingerprint: RuntimeFingerprint {
+                cwd: repo_root.display().to_string(),
+                repo_root: repo_root.display().to_string(),
+                git_head: "HEAD".to_string(),
+                git_branch: "main".to_string(),
+                git_dirty: false,
+                git_version: "git version".to_string(),
+            },
+        }
+        .write(&state_dir.join("checkpoints/cp_legacy.meta"))
+        .expect("write legacy checkpoint");
+    }
+
+    fn configure_test_git_identity(repo_root: &Path) {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("config")
+            .arg("user.name")
+            .arg("Daedalus Test")
+            .output()
+            .expect("git config user.name");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .arg("config")
+            .arg("user.email")
+            .arg("daedalus-test@example.com")
+            .output()
+            .expect("git config user.email");
     }
 
     fn create_active_run(store: &DaedalusStore, runtime: &str) -> (String, String) {
