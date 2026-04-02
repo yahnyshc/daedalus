@@ -120,6 +120,18 @@ struct StoreLocation {
     state_dir: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InitOutcome {
+    Initialized,
+    AlreadyInitialized,
+}
+
+#[derive(Clone, Debug)]
+struct InitPreparation {
+    store: DaedalusStore,
+    changed: bool,
+}
+
 impl ProvisionalRewindState {
     fn read(path: &Path) -> Result<Self> {
         let map = read_pairs(path)?;
@@ -411,20 +423,20 @@ impl DaedalusStore {
         Ok(fs::read_to_string(path)?)
     }
 
-    pub fn init(&self) -> Result<()> {
-        let store = self.store_for_init()?;
-        fs::create_dir_all(&store.runs_dir)?;
-        fs::create_dir_all(&store.timelines_dir)?;
-        fs::create_dir_all(&store.checkpoints_dir)?;
-        fs::create_dir_all(&store.transcripts_dir)?;
-        fs::create_dir_all(&store.tool_outputs_dir)?;
-        fs::create_dir_all(&store.snapshots_dir)?;
-        store.write_state_metadata(&store.desired_state_metadata())?;
-
-        fs::write(store.state_dir.join(CONFIG_FILE_NAME), DEFAULT_CONFIG_JSON)?;
+    pub fn init(&self) -> Result<InitOutcome> {
+        let InitPreparation { store, mut changed } = self.store_for_init()?;
+        changed |= ensure_directory(&store.runs_dir)?;
+        changed |= ensure_directory(&store.timelines_dir)?;
+        changed |= ensure_directory(&store.checkpoints_dir)?;
+        changed |= ensure_directory(&store.transcripts_dir)?;
+        changed |= ensure_directory(&store.tool_outputs_dir)?;
+        changed |= ensure_directory(&store.snapshots_dir)?;
+        changed |= store.ensure_state_metadata(&store.desired_state_metadata())?;
+        changed |= store.ensure_default_config()?;
         let legacy_config = store.state_dir.join(LEGACY_CONFIG_FILE_NAME);
         if legacy_config.exists() {
             fs::remove_file(legacy_config)?;
+            changed = true;
         }
 
         if !store.shadow_dir.join(".git").exists() {
@@ -436,6 +448,7 @@ impl DaedalusStore {
                     .stderr(Stdio::piped()),
                 "git init",
             )?;
+            changed = true;
         }
 
         let _ = run_command(
@@ -463,7 +476,11 @@ impl DaedalusStore {
 
         let _ = remove_legacy_repo_local_exclude(&self.repo_root);
 
-        Ok(())
+        Ok(if changed {
+            InitOutcome::Initialized
+        } else {
+            InitOutcome::AlreadyInitialized
+        })
     }
 
     pub fn ensure_initialized(&self) -> Result<()> {
@@ -846,18 +863,44 @@ impl DaedalusStore {
         metadata.write(&self.state_metadata_path())
     }
 
-    fn store_for_init(&self) -> Result<Self> {
-        let state_dir = self.prepare_state_dir_for_init()?;
-        Ok(Self::from_parts(StoreLocation {
-            repo_root: self.repo_root.clone(),
-            git_dir: self.git_dir.clone(),
-            common_git_dir: self.common_git_dir.clone(),
-            checkout_id: self.checkout_id.clone(),
-            state_dir,
-        }))
+    fn ensure_state_metadata(&self, metadata: &StateMetadataRecord) -> Result<bool> {
+        let path = self.state_metadata_path();
+        if path.exists() {
+            match StateMetadataRecord::read(&path) {
+                Ok(existing) if existing == *metadata => return Ok(false),
+                Ok(_) | Err(_) => {}
+            }
+        }
+
+        self.write_state_metadata(metadata)?;
+        Ok(true)
     }
 
-    fn prepare_state_dir_for_init(&self) -> Result<PathBuf> {
+    fn ensure_default_config(&self) -> Result<bool> {
+        let path = self.state_dir.join(CONFIG_FILE_NAME);
+        if path.exists() {
+            return Ok(false);
+        }
+
+        fs::write(path, DEFAULT_CONFIG_JSON)?;
+        Ok(true)
+    }
+
+    fn store_for_init(&self) -> Result<InitPreparation> {
+        let (state_dir, changed) = self.prepare_state_dir_for_init()?;
+        Ok(InitPreparation {
+            store: Self::from_parts(StoreLocation {
+                repo_root: self.repo_root.clone(),
+                git_dir: self.git_dir.clone(),
+                common_git_dir: self.common_git_dir.clone(),
+                checkout_id: self.checkout_id.clone(),
+                state_dir,
+            }),
+            changed,
+        })
+    }
+
+    fn prepare_state_dir_for_init(&self) -> Result<(PathBuf, bool)> {
         let legacy_state_dir = self.repo_root.join(LEGACY_STATE_DIR);
         let preferred_state_dir = self.preferred_state_dir()?;
         if self.state_dir == legacy_state_dir {
@@ -869,11 +912,10 @@ impl DaedalusStore {
                 )));
             }
             move_path(&legacy_state_dir, &preferred_state_dir)?;
-            return Ok(preferred_state_dir);
+            return Ok((preferred_state_dir, true));
         }
 
-        self.migrate_legacy_repo_state()?;
-        Ok(self.state_dir.clone())
+        Ok((self.state_dir.clone(), self.migrate_legacy_repo_state()?))
     }
 
     fn desired_state_metadata(&self) -> StateMetadataRecord {
@@ -895,10 +937,10 @@ impl DaedalusStore {
         }
     }
 
-    fn migrate_legacy_repo_state(&self) -> Result<()> {
+    fn migrate_legacy_repo_state(&self) -> Result<bool> {
         let legacy_state_dir = self.repo_root.join(LEGACY_STATE_DIR);
         if !legacy_state_dir.exists() {
-            return Ok(());
+            return Ok(false);
         }
 
         if self.state_dir.exists() {
@@ -909,7 +951,8 @@ impl DaedalusStore {
             )));
         }
 
-        move_path(&legacy_state_dir, &self.state_dir)
+        move_path(&legacy_state_dir, &self.state_dir)?;
+        Ok(true)
     }
 
     fn create_standalone_shell_run(&self, command: &[String]) -> Result<StandaloneShellRun> {
@@ -2168,7 +2211,11 @@ fn read_state_metadata_if_present(state_dir: &Path) -> Result<Option<StateMetada
     if !path.exists() {
         return Ok(None);
     }
-    Ok(Some(StateMetadataRecord::read(&path)?))
+    match StateMetadataRecord::read(&path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(DdlError::InvalidState(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn find_state_by_metadata(cwd: &Path) -> Result<Option<StoreLocation>> {
@@ -2445,6 +2492,15 @@ fn move_path(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
+fn ensure_directory(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(path)?;
+    Ok(true)
+}
+
 fn remove_path(path: &Path) -> Result<()> {
     if !path.exists() {
         return Ok(());
@@ -2612,8 +2668,8 @@ mod tests {
     use crate::runtime::{ENV_RUN_ID, ENV_RUNTIME, ENV_TIMELINE_ID};
 
     use super::{
-        DaedalusStore, STATE_METADATA_FILE_NAME, canonicalize_path, checkout_id_path, copy_path,
-        legacy_state_dir_for_repo_root, read_checkout_binding_if_present,
+        DaedalusStore, InitOutcome, STATE_METADATA_FILE_NAME, canonicalize_path, checkout_id_path,
+        copy_path, legacy_state_dir_for_repo_root, read_checkout_binding_if_present,
         read_state_metadata_if_present, resolve_common_git_dir, resolve_git_dir,
     };
 
@@ -2633,8 +2689,9 @@ mod tests {
         let repo_root = create_temp_repo("init");
 
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
-        store.init().expect("initialize store");
+        let outcome = store.init().expect("initialize store");
 
+        assert_eq!(outcome, InitOutcome::Initialized);
         assert!(!repo_root.join(".daedalus").exists());
         assert!(store.state_dir().exists());
         assert!(store.state_dir().join("shadow/.git").exists());
@@ -2643,6 +2700,34 @@ mod tests {
         assert_eq!(
             fs::read_to_string(store.state_dir().join(CONFIG_FILE_NAME)).expect("read config"),
             DEFAULT_CONFIG_JSON
+        );
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_preserves_existing_config_and_reports_already_initialized() {
+        let repo_root = create_temp_repo("init-idempotent");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let config_path = store.state_dir().join(CONFIG_FILE_NAME);
+        let custom_config = r#"{
+  "checkpointing": {
+    "before": [
+      "Edit(*)",
+      "Bash(npm install:*)"
+    ]
+  }
+}
+"#;
+        fs::write(&config_path, custom_config).expect("write custom config");
+
+        let outcome = store.init().expect("reinitialize store");
+        assert_eq!(outcome, InitOutcome::AlreadyInitialized);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            custom_config
         );
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");

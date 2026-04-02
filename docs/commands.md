@@ -3,7 +3,8 @@
 The current implementation is Claude-first and uses checkpointing at wrapped mutation boundaries.
 Rule matching flows through a shared internal tool invocation model so the same matcher is used for Claude hooks and direct shell execution.
 
-- `ddl init` creates per-repo state under `~/.daedalus` by default or `$DAEDALUS_HOME`, initializes the shadow git repository, writes the config there, and records the workspace root for later recovery.
+- `ddl init` creates per-repo state under `~/.daedalus` by default or `$DAEDALUS_HOME`, initializes the shadow git repository, writes the default config on first init, and records the workspace root for later recovery.
+- re-running `ddl init` on an existing state directory preserves `config.json` and reports that the repo is already initialized.
 - `ddl config` prints the current checkout's config and `ddl config edit` opens it through `$EDITOR`.
 - `ddl where` prints the current checkout's repo root, state id, resolved state directory, and key metadata paths.
 - `ddl run -- claude <args...>` launches Claude from the repo root and injects a session-scoped `PreToolUse` hook for `Edit|MultiEdit|Write|Bash`.

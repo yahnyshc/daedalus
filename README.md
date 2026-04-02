@@ -197,7 +197,8 @@ ddl restore <checkpoint_id>
 ddl rewind <checkpoint_id>
 ```
 
-- `ddl init` creates per-repo state under `~/.daedalus` by default, initializes the shadow git repository, and writes the checkpointing config there
+- `ddl init` creates per-repo state under `~/.daedalus` by default, initializes the shadow git repository, and writes the default checkpointing config there on first init
+- re-running `ddl init` preserves an existing `config.json` and reports that the repo is already initialized
 - `ddl config` shows the current repo config and `ddl config edit` opens it in `$EDITOR`
 - `ddl where` prints the current checkout's repo root, state id, state directory, and key metadata paths so users can inspect or remove stored state directly
 - `ddl run` launches Claude from the repo root with checkpoint protection enabled

@@ -13,7 +13,7 @@ use crate::presentation::{
     RecoveryCapability, continuation_label, format_absolute_time, latest_action_label,
     recovery_capability, session_status_label, session_title, tool_event_label, tool_event_preview,
 };
-use crate::store::DaedalusStore;
+use crate::store::{DaedalusStore, InitOutcome};
 
 pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
     let arguments = parse_arguments(args)?;
@@ -25,8 +25,8 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         }
         CommandLine::Init => {
             let store = DaedalusStore::discover()?;
-            store.init()?;
-            print!("{}", render_init_success(&store)?);
+            let outcome = store.init()?;
+            print!("{}", render_init_success(&store, outcome)?);
             Ok(0)
         }
         CommandLine::Config { action } => {
@@ -298,15 +298,15 @@ fn print_log(store: &DaedalusStore) -> Result<()> {
     Ok(())
 }
 
-fn render_init_success(store: &DaedalusStore) -> Result<String> {
+fn render_init_success(store: &DaedalusStore, outcome: InitOutcome) -> Result<String> {
     let state_dir = store.resolved_state_dir()?;
     let config_path = state_dir.join(CONFIG_FILE_NAME);
     let mut output = String::new();
-    let _ = writeln!(
-        output,
-        "initialized daedalus state in {}",
-        state_dir.display()
-    );
+    let status = match outcome {
+        InitOutcome::Initialized => "initialized daedalus state in",
+        InitOutcome::AlreadyInitialized => "daedalus state already initialized in",
+    };
+    let _ = writeln!(output, "{status} {}", state_dir.display());
     let _ = writeln!(
         output,
         "run `ddl config` to inspect rules or `ddl config edit` to change them"
@@ -507,7 +507,7 @@ mod tests {
         CheckpointKind, CheckpointRecord, Resumability, RunRecord, RunStatus, RuntimeFingerprint,
         TimelineRecord,
     };
-    use crate::store::DaedalusStore;
+    use crate::store::{DaedalusStore, InitOutcome};
 
     use super::{
         CommandLine, ConfigAction, editor_command_argv, parse_arguments, render_config,
@@ -734,10 +734,25 @@ mod tests {
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
 
-        let output = render_init_success(&store).expect("render init success");
+        let output =
+            render_init_success(&store, InitOutcome::Initialized).expect("render init success");
         assert!(output.contains("initialized daedalus state in"));
         assert!(output.contains("`ddl config`"));
         assert!(output.contains("`ddl config edit`"));
+        assert!(output.contains("config path:"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_success_mentions_existing_state_when_reinitialized() {
+        let repo_root = create_temp_repo("app-init-existing-message");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let output = render_init_success(&store, InitOutcome::AlreadyInitialized)
+            .expect("render init success");
+        assert!(output.contains("daedalus state already initialized in"));
         assert!(output.contains("config path:"));
 
         fs::remove_dir_all(repo_root).expect("cleanup temp repo");
