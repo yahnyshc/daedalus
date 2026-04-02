@@ -1,20 +1,22 @@
 # State Layout
 
-Runtime state is stored in a hidden repo-local directory:
+Runtime state is stored outside the repo, under `~/.daedalus` by default or `$DAEDALUS_HOME` when overridden:
 
 ```text
-.daedalus/
-  config.json
-  store.meta
-  runs/
-  timelines/
-  checkpoints/
-  transcripts/
-  tool_outputs/
-  runtime/
-  shadow/
-    .git/
-    snapshots/
+~/.daedalus/
+  repos/
+    <repo-id>/
+      config.json
+      store.meta
+      runs/
+      timelines/
+      checkpoints/
+      transcripts/
+      tool_outputs/
+      runtime/
+      shadow/
+        .git/
+        snapshots/
 ```
 
 Notes:
@@ -22,6 +24,8 @@ Notes:
 - `runs/`, `timelines/`, and `checkpoints/` contain hex-encoded line-based metadata records.
 - `config.json` contains the current checkpointing rules. Older repos with only the legacy `config` file should be re-initialized or migrated.
 - `store.meta` records the workspace root so `ddl` can keep operating even if the live `.git` directory is missing.
+- `<repo-id>` is a stable per-checkout Daedalus ID stored in the checkout's Git admin directory, so renaming or moving the checkout does not orphan external state.
+- `store.meta` also records the canonical Git common-dir path for discovery and fallback.
 - `runtime/` contains per-run wrapper shims, Claude hook helpers, and runtime metadata such as Claude session ids plus experimental Claude rewind snapshots.
 - `runtime/<run_id>/session.meta` stores rewind-relevant metadata for owned Claude runs.
 - `runtime/<run_id>/claude-checkpoints/<checkpoint_id>/` stores experimental Claude local rewind state when captured.

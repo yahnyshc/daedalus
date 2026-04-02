@@ -8,13 +8,13 @@ The current base is split into a few stable responsibilities:
 - JSON config parsing, normalized tool invocation construction, and checkpoint rule matching
 - domain types for runs, timelines, checkpoints, and resumability
 - metadata encoding and persistence
-- repo-local state management under `.daedalus/`
+- per-repo state management under `~/.daedalus/` or `$DAEDALUS_HOME`
 - runtime wrapper preparation for Claude Code
 - a shadow git repository used to version checkpoint snapshots
 
 The product boundary is intentionally narrow:
 
-- workspace files are recoverable from `.daedalus`
+- workspace files are recoverable from external Daedalus state
 - Claude local state is recoverable on Claude-backed checkpoints when captured
 - the live repository `.git` directory is not part of `daedalus` recovery and remains Git's responsibility
 
