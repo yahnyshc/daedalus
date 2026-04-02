@@ -59,10 +59,17 @@ Install the local CLI:
 cargo install --path crates/ddl
 ```
 
-Initialize repo-local state:
+Initialize per-repo Daedalus state:
 
 ```bash
 ddl init
+```
+
+Inspect or edit checkpoint rules for the current checkout:
+
+```bash
+ddl config
+ddl config edit
 ```
 
 Run Claude under protection:
@@ -92,7 +99,8 @@ Today that means:
 - `Write(*)`
 - configured `Bash(...)` rules
 
-`ddl init` writes a repo-local config at `.daedalus/config.json`:
+`ddl init` writes per-repo config under `~/.daedalus/repos/<repo-id>/config.json` by default
+or `$DAEDALUS_HOME/repos/<repo-id>/config.json` when overridden:
 
 ```json
 {
@@ -101,7 +109,6 @@ Today that means:
       "Edit(*)",
       "MultiEdit(*)",
       "Write(*)",
-      "Bash(npm install:*)",
       "Bash(rm:*)",
       "Bash(mv:*)"
     ]
@@ -144,7 +151,7 @@ Use `ddl rewind` when all of the following are true:
 Protected today:
 
 - workspace files
-- repo-local checkpoint metadata under `.daedalus/`
+- per-repo checkpoint metadata under `~/.daedalus/repos/<repo-id>/`
 - Claude-backed local rewind snapshot data when captured
 
 Checkpoint coverage today:
@@ -157,7 +164,7 @@ Checkpoint coverage today:
 For Claude-backed runs owned by `daedalus`, checkpoints also record:
 
 - the Claude session id
-- a best-effort local Claude rewind snapshot under `.daedalus/runtime/<run_id>/claude-checkpoints/<checkpoint_id>/`
+- a best-effort local Claude rewind snapshot under `~/.daedalus/repos/<repo-id>/runtime/<run_id>/claude-checkpoints/<checkpoint_id>/`
 
 That snapshot currently covers:
 
@@ -174,12 +181,14 @@ The v1 scope is intentionally narrow:
 - External side effects outside the workspace are not rewound.
 - The current Claude snapshot is best-effort and does not cover all of `~/.claude`, subagent state, task state, telemetry, or vendor UI state.
 - Symlink snapshots are rejected.
-- `ddl restore` replaces the current workspace snapshot and removes files created after the checkpoint while leaving `.git`, `.daedalus`, and `target` untouched.
+- `ddl restore` replaces the current workspace snapshot and removes files created after the checkpoint while leaving `.git` and `target` untouched.
 
 ## Commands
 
 ```bash
 ddl init
+ddl config [path|edit]
+ddl where
 ddl run -- claude <args...>
 ddl shell -- <command>
 ddl log
@@ -188,7 +197,9 @@ ddl restore <checkpoint_id>
 ddl rewind <checkpoint_id>
 ```
 
-- `ddl init` creates repo-local state, initializes the shadow git repository, and writes `.daedalus/config.json`
+- `ddl init` creates per-repo state under `~/.daedalus` by default, initializes the shadow git repository, and writes the checkpointing config there
+- `ddl config` shows the current repo config and `ddl config edit` opens it in `$EDITOR`
+- `ddl where` prints the current checkout's repo root, state id, state directory, and key metadata paths so users can inspect or remove stored state directly
 - `ddl run` launches Claude from the repo root with checkpoint protection enabled
 - `ddl shell` runs a shell command through the same checkpoint matcher
 - `ddl log` shows recent checkpoints and available recovery actions
@@ -200,7 +211,7 @@ ddl rewind <checkpoint_id>
 
 The current shell-first base includes:
 
-- repo-local `.daedalus/` state
+- per-repo state under `~/.daedalus/`
 - a shadow git-backed snapshot store
 - automatic checkpointing before configured Bash rules
 - Claude `PreToolUse` hook checkpointing for `Edit`, `MultiEdit`, `Write`, and `Bash`

@@ -10,7 +10,6 @@ pub const DEFAULT_CONFIG_JSON: &str = r#"{
       "Edit(*)",
       "MultiEdit(*)",
       "Write(*)",
-      "Bash(npm install:*)",
       "Bash(rm:*)",
       "Bash(mv:*)"
     ]
@@ -768,7 +767,7 @@ mod tests {
     #[test]
     fn parses_default_json_config() {
         let config = DaedalusConfig::parse(DEFAULT_CONFIG_JSON).expect("parse config");
-        assert_eq!(config.checkpointing.before.len(), 6);
+        assert_eq!(config.checkpointing.before.len(), 5);
         assert_eq!(config.checkpointing.before[0].tool, ToolKind::Edit);
         assert_eq!(config.checkpointing.before[1].tool, ToolKind::MultiEdit);
         assert_eq!(config.checkpointing.before[3].tool, ToolKind::Bash);
@@ -802,7 +801,7 @@ mod tests {
                     "install".into(),
                     "foo".into(),
                 ]))
-                .is_some()
+                .is_none()
         );
         assert!(
             config

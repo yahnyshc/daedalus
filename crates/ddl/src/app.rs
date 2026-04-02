@@ -1,8 +1,12 @@
+use std::env;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::path::Path;
+use std::process::Command;
 
+use crate::config::{CONFIG_FILE_NAME, split_command_words};
 use crate::error::{DdlError, Result};
 use crate::log_ui::{LogUiExit, run_log_ui};
 use crate::presentation::{
@@ -22,10 +26,24 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
         CommandLine::Init => {
             let store = DaedalusStore::discover()?;
             store.init()?;
-            println!(
-                "initialized daedalus state in {}",
-                store.repo_root().join(".daedalus").display()
-            );
+            print!("{}", render_init_success(&store)?);
+            Ok(0)
+        }
+        CommandLine::Config { action } => {
+            let store = DaedalusStore::discover()?;
+            match action {
+                ConfigAction::Show => print!("{}", render_config(&store)?),
+                ConfigAction::Path => {
+                    let _ = store.read_config_text()?;
+                    println!("{}", store.resolved_config_path()?.display());
+                }
+                ConfigAction::Edit => edit_config(&store)?,
+            }
+            Ok(0)
+        }
+        CommandLine::Where => {
+            let store = DaedalusStore::discover()?;
+            print!("{}", render_where(&store)?);
             Ok(0)
         }
         CommandLine::Run { command } => {
@@ -105,6 +123,10 @@ pub fn run_cli(args: impl IntoIterator<Item = OsString>) -> Result<i32> {
 enum CommandLine {
     Help,
     Init,
+    Config {
+        action: ConfigAction,
+    },
+    Where,
     Run {
         command: Vec<String>,
     },
@@ -125,6 +147,13 @@ enum CommandLine {
     },
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum ConfigAction {
+    Show,
+    Path,
+    Edit,
+}
+
 fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLine> {
     let parts = args
         .into_iter()
@@ -138,6 +167,8 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
     match parts[1].as_str() {
         "-h" | "--help" | "help" => Ok(CommandLine::Help),
         "init" => Ok(CommandLine::Init),
+        "config" => parse_config(parts),
+        "where" => Ok(CommandLine::Where),
         "log" => Ok(CommandLine::Log),
         "internal" => parse_internal(parts),
         "run" => parse_run(parts),
@@ -154,6 +185,27 @@ fn parse_arguments(args: impl IntoIterator<Item = OsString>) -> Result<CommandLi
             "unknown command `{other}`; run `ddl --help` for usage"
         ))),
     }
+}
+
+fn parse_config(parts: Vec<String>) -> Result<CommandLine> {
+    let action = match parts.get(2).map(String::as_str) {
+        None => ConfigAction::Show,
+        Some("path") => ConfigAction::Path,
+        Some("edit") => ConfigAction::Edit,
+        Some(other) => {
+            return Err(DdlError::InvalidInput(format!(
+                "unknown config command `{other}`; usage: ddl config [path|edit]"
+            )));
+        }
+    };
+
+    if parts.len() > 3 {
+        return Err(DdlError::InvalidInput(
+            "usage: ddl config [path|edit]".to_string(),
+        ));
+    }
+
+    Ok(CommandLine::Config { action })
 }
 
 fn parse_internal(parts: Vec<String>) -> Result<CommandLine> {
@@ -244,6 +296,93 @@ fn resolve_diff_targets(
 fn print_log(store: &DaedalusStore) -> Result<()> {
     print!("{}", render_log(store)?);
     Ok(())
+}
+
+fn render_init_success(store: &DaedalusStore) -> Result<String> {
+    let state_dir = store.resolved_state_dir()?;
+    let config_path = state_dir.join(CONFIG_FILE_NAME);
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "initialized daedalus state in {}",
+        state_dir.display()
+    );
+    let _ = writeln!(
+        output,
+        "run `ddl config` to inspect rules or `ddl config edit` to change them"
+    );
+    let _ = writeln!(output, "config path: {}", config_path.display());
+    Ok(output)
+}
+
+fn render_config(store: &DaedalusStore) -> Result<String> {
+    let state_id = store.state_id()?;
+    let config_path = store.resolved_config_path()?;
+    let config_text = store.read_config_text()?;
+    let mut output = String::new();
+    let _ = writeln!(output, "Repo root: {}", store.repo_root().display());
+    let _ = writeln!(output, "State id: {state_id}");
+    let _ = writeln!(output, "Config path: {}", config_path.display());
+    output.push('\n');
+    output.push_str(&config_text);
+    if !config_text.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn edit_config(store: &DaedalusStore) -> Result<()> {
+    let config_path = store.resolved_config_path()?;
+    let _ = store.read_config_text()?;
+    let command_argv = editor_command_argv(env::var("EDITOR").ok().as_deref(), &config_path)?;
+    let program = command_argv[0].clone();
+    let status = Command::new(&program).args(&command_argv[1..]).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DdlError::CommandFailed {
+            program,
+            status: status.code(),
+            stderr: String::new(),
+        })
+    }
+}
+
+fn editor_command_argv(editor: Option<&str>, path: &Path) -> Result<Vec<String>> {
+    let editor = editor
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DdlError::InvalidInput(
+                "EDITOR is not set; set `EDITOR` or use `ddl config path` to open the file manually"
+                    .to_string(),
+            )
+        })?;
+    let mut argv = split_command_words(editor).map_err(|error| {
+        DdlError::InvalidInput(format!("invalid EDITOR value `{editor}`: {error}"))
+    })?;
+    if argv.is_empty() {
+        return Err(DdlError::InvalidInput(
+            "EDITOR is not set; set `EDITOR` or use `ddl config path` to open the file manually"
+                .to_string(),
+        ));
+    }
+    argv.push(path.display().to_string());
+    Ok(argv)
+}
+
+fn render_where(store: &DaedalusStore) -> Result<String> {
+    let state_dir = store.resolved_state_dir()?;
+    let state_id = store.state_id()?;
+    let config_path = store.resolved_config_path()?;
+    let metadata_path = state_dir.join("store.meta");
+    let mut output = String::new();
+    let _ = writeln!(output, "Repo root: {}", store.repo_root().display());
+    let _ = writeln!(output, "State id: {state_id}");
+    let _ = writeln!(output, "State dir: {}", state_dir.display());
+    let _ = writeln!(output, "Config: {}", config_path.display());
+    let _ = writeln!(output, "Metadata: {}", metadata_path.display());
+    Ok(output)
 }
 
 fn render_log(store: &DaedalusStore) -> Result<String> {
@@ -345,6 +484,8 @@ daedalus v1 CLI
 
 Usage:
   ddl init
+  ddl config [path|edit]
+  ddl where
   ddl run -- claude <args...>
   ddl shell -- <command>
   ddl log
@@ -359,7 +500,7 @@ Usage:
 mod tests {
     use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
     use crate::model::{
@@ -368,13 +509,17 @@ mod tests {
     };
     use crate::store::DaedalusStore;
 
-    use super::{CommandLine, parse_arguments, render_log};
+    use super::{
+        CommandLine, ConfigAction, editor_command_argv, parse_arguments, render_config,
+        render_init_success, render_log, render_where,
+    };
 
     #[test]
     fn log_surfaces_claude_rewind_availability() {
         let repo_root = create_temp_repo("app-log");
         let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
         store.init().expect("initialize store");
+        let state_dir = store.state_dir().to_path_buf();
 
         let created_at = 1;
         TimelineRecord {
@@ -382,7 +527,7 @@ mod tests {
             run_id: "run_test".to_string(),
             created_at,
         }
-        .write(&repo_root.join(".daedalus/timelines/tl_test.meta"))
+        .write(&state_dir.join("timelines/tl_test.meta"))
         .expect("write timeline");
         RunRecord {
             id: "run_test".to_string(),
@@ -395,13 +540,13 @@ mod tests {
             rewind_source_checkpoint_id: None,
             resumability: Resumability::Full,
         }
-        .write(&repo_root.join(".daedalus/runs/run_test.meta"))
+        .write(&state_dir.join("runs/run_test.meta"))
         .expect("write run");
-        let snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_test");
+        let snapshot_path = state_dir.join("shadow/snapshots/cp_test");
         fs::create_dir_all(&snapshot_path).expect("create snapshot");
-        let head_snapshot_path = repo_root.join(".daedalus/shadow/snapshots/cp_head");
+        let head_snapshot_path = state_dir.join("shadow/snapshots/cp_head");
         fs::create_dir_all(&head_snapshot_path).expect("create head snapshot");
-        let rewind_path = repo_root.join(".daedalus/runtime/run_test/claude-checkpoints/cp_full");
+        let rewind_path = state_dir.join("runtime/run_test/claude-checkpoints/cp_full");
         fs::create_dir_all(&rewind_path).expect("create rewind snapshot");
         fs::write(rewind_path.join("marker.txt"), "saved").expect("write rewind marker");
         CheckpointRecord {
@@ -429,7 +574,7 @@ mod tests {
                 git_version: "git version".to_string(),
             },
         }
-        .write(&repo_root.join(".daedalus/checkpoints/cp_test.meta"))
+        .write(&state_dir.join("checkpoints/cp_test.meta"))
         .expect("write checkpoint");
         CheckpointRecord {
             id: "cp_head".to_string(),
@@ -456,7 +601,7 @@ mod tests {
                 git_version: "git version".to_string(),
             },
         }
-        .write(&repo_root.join(".daedalus/checkpoints/cp_head.meta"))
+        .write(&state_dir.join("checkpoints/cp_head.meta"))
         .expect("write session head checkpoint");
 
         let output = render_log(&store).expect("render log");
@@ -505,6 +650,111 @@ mod tests {
         ])
         .expect_err("fork should be removed");
         assert!(error.to_string().contains("unknown command `fork`"));
+    }
+
+    #[test]
+    fn parse_arguments_accepts_where() {
+        match parse_arguments([OsString::from("ddl"), OsString::from("where")])
+            .expect("parse where")
+        {
+            CommandLine::Where => {}
+            _ => panic!("expected where command"),
+        }
+    }
+
+    #[test]
+    fn parse_arguments_accepts_config_variants() {
+        match parse_arguments([OsString::from("ddl"), OsString::from("config")])
+            .expect("parse config")
+        {
+            CommandLine::Config { action } => assert_eq!(action, ConfigAction::Show),
+            _ => panic!("expected config show command"),
+        }
+
+        match parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("config"),
+            OsString::from("path"),
+        ])
+        .expect("parse config path")
+        {
+            CommandLine::Config { action } => assert_eq!(action, ConfigAction::Path),
+            _ => panic!("expected config path command"),
+        }
+
+        match parse_arguments([
+            OsString::from("ddl"),
+            OsString::from("config"),
+            OsString::from("edit"),
+        ])
+        .expect("parse config edit")
+        {
+            CommandLine::Config { action } => assert_eq!(action, ConfigAction::Edit),
+            _ => panic!("expected config edit command"),
+        }
+    }
+
+    #[test]
+    fn render_where_surfaces_state_location() {
+        let repo_root = create_temp_repo("app-where");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let output = render_where(&store).expect("render where");
+        assert!(output.contains("Repo root:"));
+        assert!(output.contains(&repo_root.display().to_string()));
+        assert!(output.contains("State id:"));
+        assert!(output.contains("State dir:"));
+        assert!(output.contains("Config:"));
+        assert!(output.contains("Metadata:"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn render_config_surfaces_config_contents() {
+        let repo_root = create_temp_repo("app-config");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let output = render_config(&store).expect("render config");
+        assert!(output.contains("Repo root:"));
+        assert!(output.contains("State id:"));
+        assert!(output.contains("Config path:"));
+        assert!(output.contains("\"checkpointing\""));
+        assert!(output.contains("Bash(rm:*)"));
+        assert!(!output.contains("Bash(npm install:*)"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn init_success_mentions_config_commands() {
+        let repo_root = create_temp_repo("app-init-message");
+        let store = DaedalusStore::discover_from(&repo_root).expect("discover store");
+        store.init().expect("initialize store");
+
+        let output = render_init_success(&store).expect("render init success");
+        assert!(output.contains("initialized daedalus state in"));
+        assert!(output.contains("`ddl config`"));
+        assert!(output.contains("`ddl config edit`"));
+        assert!(output.contains("config path:"));
+
+        fs::remove_dir_all(repo_root).expect("cleanup temp repo");
+    }
+
+    #[test]
+    fn editor_command_argv_requires_editor() {
+        let error = editor_command_argv(None, Path::new("/tmp/config.json"))
+            .expect_err("missing editor should fail");
+        assert!(error.to_string().contains("EDITOR is not set"));
+    }
+
+    #[test]
+    fn editor_command_argv_appends_config_path() {
+        let argv = editor_command_argv(Some("code --wait"), Path::new("/tmp/daedalus/config.json"))
+            .expect("build editor argv");
+        assert_eq!(argv, vec!["code", "--wait", "/tmp/daedalus/config.json"]);
     }
 
     fn create_temp_repo(name: &str) -> PathBuf {
