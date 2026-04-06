@@ -1,9 +1,13 @@
 [package]
-name = "ddl"
+name = "daedalus-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Claude Code recovery with repo restore and session rewind."
+homepage = "https://github.com/yahnyshc/daedalus"
+documentation = "https://docs.rs/daedalus-cli"
+readme = "../../README.md"
 
 [lib]
 name = "ddl"

@@ -53,7 +53,15 @@ AI coding workflows have a specific failure mode:
 
 ## Quickstart
 
-Install the local CLI:
+Install from crates.io after the first publish:
+
+```bash
+cargo install daedalus-cli
+```
+
+The published package is `daedalus-cli`. The installed command remains `ddl`.
+
+Install from a local checkout:
 
 ```bash
 cargo install --path crates/ddl
