@@ -87,6 +87,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daedalus-cli"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "uuid",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -118,15 +127,6 @@ dependencies = [
  "darling_core",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "ddl"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ratatui",
- "uuid",
 ]
 
 [[package]]

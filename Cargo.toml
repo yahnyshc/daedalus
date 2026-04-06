@@ -5,5 +5,5 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/yahnyshc/daedalus"
 version = "0.1.0"
-

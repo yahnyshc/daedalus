@@ -40,7 +40,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }} --package ddl
+        run: cargo build --locked --release --target ${{ matrix.target }} --package daedalus-cli
 
       - name: Package archive
         id: package_unix

@@ -1,6 +1,6 @@
 # Architecture
 
-The codebase is a Rust workspace with a single CLI crate, `ddl`.
+The codebase is a Rust workspace with a single CLI crate, published as `daedalus-cli` and exposing the `ddl` binary.
 
 The current base is split into a few stable responsibilities:
 
